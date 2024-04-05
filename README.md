@@ -1,8 +1,11 @@
-# NanoGEMM
+# simpleGEMM
 
-This is an *extremely* minimalistic but fast implementation of matrix multiplication in CUDA. The implementation is a single, 300-line file [gemm.cu](gemm.cu) which implements half-precision tensor core matrix multiplication, optimised for Turing (SM75) architecture. 
+![img-uNPCSD5UDSQHHgRJpcDy7Lzf](https://github.com/andylolu2/simpleGEMM/assets/66584117/5def8c80-9e51-49ee-ba1f-9538e072083e)
 
-The implementation builds on top of CuTe from CUTLASS, a low-level interface for tensor manipulation in CUDA. The code is well-commented and is meant to be easily readable (minimal CUDA/C++ background knowledge required) and hackable.
+
+This is an *extremely* minimalistic but fast implementation of matrix multiplication in CUDA. The source code is a single, 300-line file [gemm.cu](gemm.cu) which implements half-precision tensor core matrix multiplication, optimised for Turing (SM75) architecture. 
+
+The implementation builds on top of CuTe from [CUTLASS](https://github.com/NVIDIA/cutlass), a low-level interface for tensor manipulation in CUDA. The code is well-commented and is meant to be easily readable (minimal CUDA/C++ background knowledge required) and hackable.
 
 Benchmark against SOTA (see [reference.cu](reference.cu)):
 ```
@@ -58,7 +61,7 @@ $ cd build/
 $ cmake ..
 -- Configuring done
 -- Generating done
--- Build files have been written to: /workspaces/nanoGEMM/build
+-- Build files have been written to: /workspaces/simpleGEMM/build
 $ make gemm 
 Consolidate compiler generated dependencies of target gemm
 [ 50%] Building CUDA object CMakeFiles/gemm.dir/gemm.cu.o

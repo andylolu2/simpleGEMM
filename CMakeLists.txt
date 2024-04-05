@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 
-project(nanoGEMM)
+project(simpleGEMM)
 enable_language(CUDA CXX)
 
 if(NOT CMAKE_BUILD_TYPE)
