@@ -3,17 +3,20 @@
 ![img-uNPCSD5UDSQHHgRJpcDy7Lzf](https://github.com/andylolu2/simpleGEMM/assets/66584117/5def8c80-9e51-49ee-ba1f-9538e072083e)
 
 
-This is an *extremely* minimalistic but fast implementation of matrix multiplication in CUDA. The source code is a single, 300-line file [gemm.cu](gemm.cu) which implements half-precision tensor core matrix multiplication, optimised for Turing (SM75) architecture. 
+This is an *extremely* minimalistic but fast implementation of matrix multiplication in CUDA. The source code is a single, 300-line file [gemm.cuh](gemm.cuh) which implements half-precision tensor core matrix multiplication, optimised for Turing (SM75) architecture. 
 
 The implementation builds on top of CuTe from [CUTLASS](https://github.com/NVIDIA/cutlass), a low-level interface for tensor manipulation in CUDA. The code is well-commented and is meant to be easily readable (minimal CUDA/C++ background knowledge required) and hackable.
 
-Benchmark against SOTA (see [reference.cu](reference.cu)):
+Benchmark against standard implementations (see [main.cu](main.cu) and [reference.cu](test/reference.cu)):
 ```
-$ ./gemm 4096 4096 4096 1000
+$ ./main
+Usage: ./main M N K iters
+
+$ ./main 4096 4096 4096 1000
 Time elapse: 6043.59ms
 TFLOPS: 22.7413
 
-$ ./gemm 8192 8192 8192 100
+$ ./main 8192 8192 8192 100
 Time elapse: 4819.51ms
 TFLOPS: 22.8138
 
@@ -31,25 +34,26 @@ TFLOPS: 23.6095
 
 > Requires CUDA installed. Checkout https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ for instructions.
 
-Compile the source file:
+Compile the [`main.cu`](main.cu) file:
 ```bash
 nvcc \
+    --include-path ./ \
     --include-path cutlass/include \
     --generate-code=arch=compute_75,code=[compute_75,sm_75] \
     --expt-relaxed-constexpr \
     -forward-unknown-to-host-compiler \
     -std=c++17 \
     -O3 \
-    -o build/gemm \
-    gemm.cu
+    -o build/main \
+    main.cu
 ```
 
 And run!
 ```
-$ ./gemm
-Usage: ./gemm M N K iters
+$ ./build/main
+Usage: ./main M N K iters
 
-$ ./gemm 4096 4096 4096 1000
+$ ./build/main 4096 4096 4096 1000
 Time elapse: 6043.59ms
 TFLOPS: 22.7413
 ```
@@ -62,13 +66,13 @@ $ cmake ..
 -- Configuring done
 -- Generating done
 -- Build files have been written to: /workspaces/simpleGEMM/build
-$ make gemm 
-Consolidate compiler generated dependencies of target gemm
-[ 50%] Building CUDA object CMakeFiles/gemm.dir/gemm.cu.o
-[100%] Linking CUDA executable gemm
-[100%] Built target gemm
-$ ./gemm 
-Usage: ./gemm M N K iters
+$ make main 
+Consolidate compiler generated dependencies of target main
+[ 50%] Building CUDA object CMakeFiles/main.dir/main.cu.o
+[100%] Linking CUDA executable main
+[100%] Built target main
+$ ./main
+Usage: ./main M N K iters
 ```
 
 ## What's missing
