@@ -7,9 +7,9 @@ int main(int argc, char const *argv[]) {
         std::cout << "Usage: " << argv[0] << " M N K iters" << std::endl;
         return 1;
     }
-    int M = atoi(argv[1]);
-    int N = atoi(argv[2]);
-    int K = atoi(argv[3]);
+    int64_t M = atoi(argv[1]);
+    int64_t N = atoi(argv[2]);
+    int64_t K = atoi(argv[3]);
     size_t iters = atoi(argv[4]);
 
     using ElementAccumulator = float;                   // <- data type of accumulator
@@ -60,7 +60,8 @@ int main(int argc, char const *argv[]) {
     // Start benchmark
     cudaEventRecord(start_event);
     for (size_t i = 0; i < iters; i++) {
-        cutlass::Status status = gemm_op({{M, N, K}, A, B, C, C});
+        cutlass::Status status = gemm_op(
+            {{static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)}, A, B, C, C});
     }
     cudaEventRecord(end_event);
 
