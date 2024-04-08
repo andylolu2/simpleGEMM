@@ -34,6 +34,10 @@ TFLOPS: 23.6095
 ## Quick start
 
 > Requires CUDA installed. Checkout https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ for instructions.
+> If you don't have a compatible GPU, you can run this in Colab:
+> <a target="_blank" href="https://colab.research.google.com/github/andylolu2/simpleGEMM/blob/master/colab/simpleGEMM.ipynb">
+>  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
+> </a>
 
 Compile the [`main.cu`](main.cu) file:
 ```bash
