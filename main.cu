@@ -36,7 +36,7 @@ int main(int argc, char const *argv[]) {
     // Start benchmark
     cudaEventRecord(start_event);
     for (size_t i = 0; i < iters; i++) {
-        gemm<KernelTraits<128, 128, 64, 6>>(A, B, C);
+        simplegemm::gemm(A, B, C);
     }
     cudaEventRecord(end_event);
 

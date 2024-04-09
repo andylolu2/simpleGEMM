@@ -11,17 +11,17 @@ using ct::_;
 using ct::Int;
 template <typename T>
 using Gmem = ct::ViewEngine<ct::gmem_ptr<T *>>;
-template <typename T>
-using Smem = ct::ViewEngine<ct::smem_ptr<T *>>;
 
+namespace simplegemm {
 // GEMM configuration class: Handles the compile-time computation of the kernel parameters.
-template <int BLK_M_, int BLK_N_, int BLK_K_, int GroupSizeM_>
+// Good default values are hard-coded but they might be tuned to give better performance.
 struct KernelTraits {
    public:
-    static constexpr int BLK_M = BLK_M_;
-    static constexpr int BLK_N = BLK_N_;
-    static constexpr int BLK_K = BLK_K_;
-    static constexpr int GroupSizeM = GroupSizeM_;
+    // 128x128x64 blocks seems to be a good default
+    static constexpr int BLK_M = 128;
+    static constexpr int BLK_N = 128;
+    static constexpr int BLK_K = 64;
+    static constexpr int GroupSizeM = 6;    // Generally want to choose group size ~= sqrt(no. of SMs).
     static constexpr int NumThreads = 128;  // 4 warps
 
     // Row-major A, B, C
@@ -96,23 +96,60 @@ struct KernelTraits {
     using SmemTiledCopyB = decltype(ct::make_tiled_copy_B(SmemCopyAtom{}, TiledMMA{}));
 };
 
-template <typename KernelTraits, typename LayoutGaSrc, typename LayoutGaDst, typename LayoutGbSrc,
-          typename LayoutGbDst>
-__device__ void gemm_thread(
-    const ct::Tensor<Gmem<ct::half_t>, LayoutGaSrc> &gA_to_sA_src,
-    ct::Tensor<Smem<ct::half_t>, LayoutGaDst> &gA_to_sA_dst,
-    const ct::Tensor<Gmem<ct::half_t>, LayoutGbSrc> &gB_to_sB_src,
-    ct::Tensor<Smem<ct::half_t>, LayoutGbDst> &gB_to_sB_dst,
-    const ct::Tensor<Smem<ct::half_t>, typename KernelTraits::SmemLayoutA> &sA,
-    const ct::Tensor<Smem<ct::half_t>, typename KernelTraits::SmemLayoutB> &sB,
-    const ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutBlkC> &C_blk) {
+__device__ std::tuple<int, int> threadblock_swizzle(int idx, int m, int n, int group_size_m) {
+    // Reordering the block access pattern helps to improve L2 cache hit rate.
+    // Triton's doc for matmul has a nice explanation: https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
+    // For m = 3, n = 4, group_size_m = 2, produces the coordiantes in the following order:
+    //  |  1 |  3 |  5 |  7 |
+    //  |  2 |  4 |  6 |  8 |
+    //  |  9 | 10 | 11 | 12 |
+    int blocks_per_group = group_size_m * n;
+    int first_block_idx_m = (idx / blocks_per_group) * group_size_m;
+    group_size_m = min(m - first_block_idx_m, group_size_m);  // Min to handle edge case of m % group_size_m != 0
+    int block_idx_m = first_block_idx_m + (idx % group_size_m);
+    int block_idx_n = (idx % blocks_per_group) / group_size_m;
+    return std::make_tuple(block_idx_m, block_idx_n);
+}
+
+// Main kernel
+__global__ void gemm_kernel(
+    ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutA> A,
+    ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutB> B,
+    ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutC> C) {
+    // Threadblock-level paratitioning
+    typename KernelTraits::BlockShapeA block_shape_A;
+    typename KernelTraits::BlockShapeB block_shape_B;
+    typename KernelTraits::BlockShapeC block_shape_C;
+    auto A_blk_all = ct::flat_divide(A, block_shape_A);  // BLK_M, BLK_K, N_BLK_M, N_BLK_K
+    auto B_blk_all = ct::flat_divide(B, block_shape_B);  // BLK_N, BLK_K, N_BLK_N, N_BLK_K
+    auto C_blk_all = ct::flat_divide(C, block_shape_C);  // BLK_M, BLK_N, N_BLK_M, N_BLK_N
+    auto [block_idx_m, block_idx_n] = threadblock_swizzle(blockIdx.x, ct::size<2>(A_blk_all), ct::size<2>(B_blk_all), KernelTraits::GroupSizeM);
+    auto A_blk = A_blk_all(_, _, block_idx_m, _);            // BLK_M, BLK_K, N_BLK_K
+    auto B_blk = B_blk_all(_, _, block_idx_n, _);            // BLK_N, BLK_K, N_BLK_K
+    auto C_blk = C_blk_all(_, _, block_idx_m, block_idx_n);  // BLK_M, BLK_N
+
+    // Allocate shared memory for the operands
+    typename KernelTraits::SmemLayoutA smem_layout_A;
+    typename KernelTraits::SmemLayoutB smem_layout_B;
+    __shared__ ct::half_t sA_data[ct::cosize_v<decltype(smem_layout_A)>];
+    __shared__ ct::half_t sB_data[ct::cosize_v<decltype(smem_layout_B)>];
+    auto sA = ct::make_tensor(ct::make_smem_ptr(sA_data), smem_layout_A);
+    auto sB = ct::make_tensor(ct::make_smem_ptr(sB_data), smem_layout_B);
+
     typename KernelTraits::GmemTiledCopyA gmem_tiled_copy_A;
-    typename KernelTraits::GmemTiledCopyB gmem_tiled_copy_B;
-    typename KernelTraits::GmemCopyC gmem_copy_C;
-    typename KernelTraits::TiledMMA tiled_mma;
+    typename KernelTraits::GmemTiledCopyA gmem_tiled_copy_B;
+    auto gmem_thr_copy_A = gmem_tiled_copy_A.get_thread_slice(threadIdx.x);
+    auto gmem_thr_copy_B = gmem_tiled_copy_B.get_thread_slice(threadIdx.x);
+
+    // Fragments for gmem -> smem copy
+    auto gA_to_sA_src = gmem_thr_copy_A.partition_S(A_blk);  // COPY_V, COPY_M, COPY_K, N_BLK_K
+    auto gA_to_sA_dst = gmem_thr_copy_A.partition_D(sA);     // COPY_V, COPY_M, COPY_K
+    auto gB_to_sB_src = gmem_thr_copy_B.partition_S(B_blk);  // COPY_V, COPY_N, COPY_K, N_BLK_K
+    auto gB_to_sB_dst = gmem_thr_copy_B.partition_D(sB);     // COPY_V, COPY_N, COPY_K
 
     // Fragments of the warp-level tiles (distributed across threads' registers)
     // They will be inputs/outputs of the warp-level GEMM
+    typename KernelTraits::TiledMMA tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
     auto rA = thr_mma.partition_fragment_A(sA);     // MMA, MMA_M, MMA_K
     auto rB = thr_mma.partition_fragment_B(sB);     // MMA, MMA_N, MMA_K
@@ -147,69 +184,11 @@ __device__ void gemm_thread(
     }
 
     // Write back result
+    typename KernelTraits::GmemCopyC gmem_copy_C;
     ct::copy(gmem_copy_C, rC, gC);
 }
 
-template <typename KernelTraits>
-__device__ void gemm_threadblock(
-    const ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutBlkA> &A_blk,
-    const ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutBlkB> &B_blk,
-    const ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutBlkC> &C_blk) {
-    typename KernelTraits::SmemLayoutA smem_layout_A;
-    typename KernelTraits::SmemLayoutB smem_layout_B;
-
-    __shared__ ct::half_t sA_data[ct::cosize_v<decltype(smem_layout_A)>];
-    __shared__ ct::half_t sB_data[ct::cosize_v<decltype(smem_layout_B)>];
-    auto sA = ct::make_tensor(ct::make_smem_ptr(sA_data), smem_layout_A);
-    auto sB = ct::make_tensor(ct::make_smem_ptr(sB_data), smem_layout_B);
-
-    typename KernelTraits::GmemTiledCopyA gmem_tiled_copy_A;
-    typename KernelTraits::GmemTiledCopyA gmem_tiled_copy_B;
-    auto gmem_thr_copy_A = gmem_tiled_copy_A.get_thread_slice(threadIdx.x);
-    auto gmem_thr_copy_B = gmem_tiled_copy_B.get_thread_slice(threadIdx.x);
-
-    // Fragments for gmem -> smem copy
-    auto gA_to_sA_src = gmem_thr_copy_A.partition_S(A_blk);  // COPY_V, COPY_M, COPY_K, N_BLK_K
-    auto gA_to_sA_dst = gmem_thr_copy_A.partition_D(sA);     // COPY_V, COPY_M, COPY_K
-    auto gB_to_sB_src = gmem_thr_copy_B.partition_S(B_blk);  // COPY_V, COPY_N, COPY_K, N_BLK_K
-    auto gB_to_sB_dst = gmem_thr_copy_B.partition_D(sB);     // COPY_V, COPY_N, COPY_K
-
-    gemm_thread<KernelTraits>(gA_to_sA_src, gA_to_sA_dst, gB_to_sB_src, gB_to_sB_dst, sA, sB,
-                              C_blk);
-}
-
-template <typename KernelTraits>
-__global__ void gemm_kernel(
-    ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutA> A,
-    ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutB> B,
-    ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutC> C) {
-    using BlockShapeA = typename KernelTraits::BlockShapeA;
-    using BlockShapeB = typename KernelTraits::BlockShapeB;
-    using BlockShapeC = typename KernelTraits::BlockShapeC;
-
-    auto A_blk_all = ct::tiled_divide(A, BlockShapeA{});  // (BLK_M, BLK_K), N_BLK_M, N_BLK_K
-    auto B_blk_all = ct::tiled_divide(B, BlockShapeB{});  // (BLK_N, BLK_K), N_BLK_N, N_BLK_K
-    auto C_blk_all = ct::tiled_divide(C, BlockShapeC{});  // (BLK_M, BLK_N), N_BLK_M, N_BLK_N
-
-    // Threadblock swizzling
-    // Reordering the block access pattern helps to improve L2 cache hit rate.
-    // Triton's doc for matmul has a nice explanation: https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
-    int N_BLK_M = ct::size<1>(A_blk_all);
-    int N_BLK_N = ct::size<1>(B_blk_all);
-    int blocks_per_group = KernelTraits::GroupSizeM * N_BLK_N;
-    int first_block_idx_m = (blockIdx.x / blocks_per_group) * KernelTraits::GroupSizeM;
-    int group_size_m = min(N_BLK_M - first_block_idx_m, KernelTraits::GroupSizeM);  // Edge case
-    int block_idx_m = first_block_idx_m + (blockIdx.x % group_size_m);
-    int block_idx_n = (blockIdx.x % blocks_per_group) / group_size_m;
-
-    auto A_blk = ct::flatten(A_blk_all(_, block_idx_m, _));            // BLK_M, BLK_K, N_BLK_K
-    auto B_blk = ct::flatten(B_blk_all(_, block_idx_n, _));            // BLK_N, BLK_K, N_BLK_K
-    auto C_blk = ct::flatten(C_blk_all(_, block_idx_m, block_idx_n));  // BLK_M, BLK_N
-
-    gemm_threadblock<KernelTraits>(A_blk, B_blk, C_blk);
-}
-
-template <typename KernelTraits>
+// Host interface
 void gemm(
     const ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutA> &A,
     const ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutB> &B,
@@ -228,5 +207,6 @@ void gemm(
     dim3 block_dim(ct::ceil_div(M, KernelTraits::BLK_M) * ct::ceil_div(N, KernelTraits::BLK_N));
     dim3 thread_dim(KernelTraits::NumThreads);
 
-    gemm_kernel<KernelTraits><<<block_dim, thread_dim>>>(A, B, C);
+    gemm_kernel<<<block_dim, thread_dim>>>(A, B, C);
 }
+}  // namespace simplegemm

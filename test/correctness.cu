@@ -25,6 +25,7 @@ int main(int argc, char const *argv[]) {
     cutlass::HostTensor<ct::half_t, cutlass::layout::RowMajor> A_tensor({M, K});
     cutlass::HostTensor<ct::half_t, cutlass::layout::ColumnMajor> B_tensor({K, N});
     cutlass::HostTensor<ct::half_t, cutlass::layout::RowMajor> C_tensor({M, N});
+    cutlass::HostTensor<ct::half_t, cutlass::layout::RowMajor> C_ref_tensor({M, N});
     auto A = ct::make_tensor(ct::make_gmem_ptr(A_tensor.device_data()), ct::make_layout(ct::make_shape(M, K), ct::GenRowMajor{}));
     auto B = ct::make_tensor(ct::make_gmem_ptr(B_tensor.device_data()), ct::make_layout(ct::make_shape(N, K), ct::GenRowMajor{}));
     auto C = ct::make_tensor(ct::make_gmem_ptr(C_tensor.device_data()), ct::make_layout(ct::make_shape(M, N), ct::GenRowMajor{}));
@@ -34,19 +35,17 @@ int main(int argc, char const *argv[]) {
     cutlass::reference::device::TensorFillRandomGaussian(B_tensor.device_view(), 0);
 
     // Test for correctness
-    cutlass::HostTensor<ct::half_t, cutlass::layout::RowMajor> C_ref_tensor({M, N});
-
     // Ours
-    gemm<KernelTraits<128, 128, 64, 6>>(A, B, C);
+    simplegemm::gemm(A, B, C);
     // Reference
     cutlass::reference::device::compute_gemm(
         {static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)},
-        ct::half_t(1),
+        float(1),
         A_tensor.device_ref(),
         B_tensor.device_ref(),
-        ct::half_t(0),
+        float(0),
         C_ref_tensor.device_ref(),
-        0.0f);
+        float(0));
     cudaDeviceSynchronize();
 
     // Copy output data to host for comparison
