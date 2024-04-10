@@ -44,39 +44,53 @@ int main(int argc, char const *argv[]) {
     cutlass::half_t *A_ptr;
     cutlass::half_t *B_ptr;
     cutlass::half_t *C_ptr;
-    cudaMalloc((void **)&A_ptr, M * K * sizeof(cutlass::half_t));
-    cudaMalloc((void **)&B_ptr, N * K * sizeof(cutlass::half_t));
-    cudaMalloc((void **)&C_ptr, M * N * sizeof(cutlass::half_t));
+    cudaMalloc(&A_ptr, M * K * sizeof(cutlass::half_t));
+    cudaMalloc(&B_ptr, N * K * sizeof(cutlass::half_t));
+    cudaMalloc(&C_ptr, M * N * sizeof(cutlass::half_t));
     cutlass::TensorRef<ElementInputA, LayoutInputA> A({A_ptr, K});
     cutlass::TensorRef<ElementInputB, LayoutInputB> B({B_ptr, K});
     cutlass::TensorRef<ElementOutput, LayoutOutput> C({C_ptr, N});
 
     // Time and benchmark
-    cudaEvent_t start_event;
-    cudaEvent_t end_event;
-    cudaEventCreate(&start_event);
-    cudaEventCreate(&end_event);
+    std::vector<cudaEvent_t> start_events;
+    std::vector<cudaEvent_t> end_events;
+    for (size_t i = 0; i < iters; i++) {
+        cudaEvent_t start_event;
+        cudaEvent_t end_event;
+        cudaEventCreate(&start_event);
+        cudaEventCreate(&end_event);
+        start_events.push_back(start_event);
+        end_events.push_back(end_event);
+    }
 
     // Start benchmark
-    cudaEventRecord(start_event);
+    void *z_ptr;
+    cudaMalloc(&z_ptr, 3 * 1024 * 1024);  // Size of my L2 cache
     for (size_t i = 0; i < iters; i++) {
+        cudaMemset(z_ptr, 0, 3 * 1024 * 1024);  // Flush L2 cache
+        cudaEventRecord(start_events[i]);
         cutlass::Status status = gemm_op(
             {{static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)}, A, B, C, C});
+        cudaEventRecord(end_events[i]);
     }
-    cudaEventRecord(end_event);
+    cudaFree(z_ptr);
 
     // Report benchmark results
-    cudaEventSynchronize(end_event);
-    float total_duration;  // in ms
-    cudaEventElapsedTime(&total_duration, start_event, end_event);
-    float tflops = 2 * M * N * K * iters / (total_duration / 1000) / 1E12;
+    float total_duration = 0;
+    for (size_t i = 0; i < iters; i++) {
+        cudaEventSynchronize(end_events[i]);
+        float duration;  // in ms
+        cudaEventElapsedTime(&duration, start_events[i], end_events[i]);
+        total_duration += duration;
+    }
+    float flops = 2 * M * N * K * iters / (total_duration / 1000);
     std::cout << "Time elapse: " << total_duration << "ms" << std::endl;
-    std::cout << "TFLOPS: " << tflops << std::endl;
+    std::cout << "TFLOPS: " << flops / 1e12 << std::endl;
 
     // Deallocate A, B, C
-    cudaFree((void *)A_ptr);
-    cudaFree((void *)B_ptr);
-    cudaFree((void *)C_ptr);
+    cudaFree(A_ptr);
+    cudaFree(B_ptr);
+    cudaFree(C_ptr);
 
     return 0;
 }

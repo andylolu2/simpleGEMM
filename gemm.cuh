@@ -117,16 +117,17 @@ __global__ void gemm_kernel(
     ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutB> B,
     ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutC> C) {
     // Threadblock-level paratitioning
+    auto [block_idx_m, block_idx_n] = threadblock_swizzle(
+        blockIdx.x,
+        ct::ceil_div(ct::size<0>(A), Int<KernelTraits::BLK_M>{}),
+        ct::ceil_div(ct::size<0>(B), Int<KernelTraits::BLK_N>{}),
+        KernelTraits::GroupSizeM);
     typename KernelTraits::BlockShapeA block_shape_A;
     typename KernelTraits::BlockShapeB block_shape_B;
     typename KernelTraits::BlockShapeC block_shape_C;
-    auto A_blk_all = ct::flat_divide(A, block_shape_A);  // BLK_M, BLK_K, N_BLK_M, N_BLK_K
-    auto B_blk_all = ct::flat_divide(B, block_shape_B);  // BLK_N, BLK_K, N_BLK_N, N_BLK_K
-    auto C_blk_all = ct::flat_divide(C, block_shape_C);  // BLK_M, BLK_N, N_BLK_M, N_BLK_N
-    auto [block_idx_m, block_idx_n] = threadblock_swizzle(blockIdx.x, ct::size<2>(A_blk_all), ct::size<2>(B_blk_all), KernelTraits::GroupSizeM);
-    auto A_blk = A_blk_all(_, _, block_idx_m, _);            // BLK_M, BLK_K, N_BLK_K
-    auto B_blk = B_blk_all(_, _, block_idx_n, _);            // BLK_N, BLK_K, N_BLK_K
-    auto C_blk = C_blk_all(_, _, block_idx_m, block_idx_n);  // BLK_M, BLK_N
+    auto A_blk = ct::local_tile(A, block_shape_A, ct::make_coord(block_idx_m, _));            // BLK_M, BLK_K, N_BLK_K
+    auto B_blk = ct::local_tile(B, block_shape_B, ct::make_coord(block_idx_n, _));            // BLK_N, BLK_K, N_BLK_K
+    auto C_blk = ct::local_tile(C, block_shape_C, ct::make_coord(block_idx_m, block_idx_n));  // BLK_M, BLK_N
 
     // Allocate shared memory for the operands
     typename KernelTraits::SmemLayoutA smem_layout_A;
