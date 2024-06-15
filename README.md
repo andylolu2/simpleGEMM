@@ -33,7 +33,7 @@ TFLOPS: 23.6095
 
 ## Quick start
 
-> Requires CUDA installed. Checkout https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ for instructions.
+> Requires CUDA installed. Check out https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ for instructions.
 > If you don't have a compatible GPU, you can run this in Colab:
 > <a target="_blank" href="https://colab.research.google.com/github/andylolu2/simpleGEMM/blob/master/colab/simpleGEMM.ipynb">
 >  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
@@ -63,7 +63,7 @@ Time elapse: 6043.59ms
 TFLOPS: 22.7413
 ```
 
-You can also build with `CMake` (better option for development):
+You can also build with `CMake` (a better option for development):
 ```bash
 $ mkdir build
 $ cd build/
@@ -83,8 +83,9 @@ Usage: ./main M N K iters
 ## What's missing
 
 The code trades off generality for simplicity:
-- Only supports half-precision matmul.
+- Only supports fp16 matmul out of the box. It should be quite easy to move to bf16, though.
+- Optimised for SM75 w/ tensor cores. This is probably sub-optimal for SM80+ (e.g. A100), but probably not terrible either.
 - Assumes (asserts) the inputs are divisible by the block size.
-- Assumes the inputs are in row-major layout. (Though you probably only want to row-major layout anyway as other combinations are 10-30% slower.)
+- Assumes the inputs are in row-major layout. (Though you probably only want to use a row-major layout anyway, as other combinations are 10-30% slower.)
 - Doesn't do software pipelining. (interleaving global memory load for the next tile with computation.)
 - Is only optimal for "normal" problem sizes. For more exotic problem sizes like small-M/N with large-K, specialised implementations like split-K kernel is likely to perform better.

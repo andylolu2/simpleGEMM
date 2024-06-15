@@ -36,9 +36,9 @@ struct KernelTraits {
     using LayoutBlkC = ct::Layout<ct::Shape<Int<BLK_M>, Int<BLK_N>>, ct::Stride<int64_t, Int<1>>>;
 
    private:
-    static constexpr int AccessSizeBits = ct::sizeof_bits_v<ct::uint128_t>;
+    static constexpr int AccessSizeBits = 128;
     static constexpr int ElemsPerLoad = AccessSizeBits / ct::sizeof_bits_v<ct::half_t>;
-    static constexpr int SmemAtomInner = 64;
+    static constexpr int SmemAtomInner = std::min(64, BLK_K);
     static constexpr int SmemAtomOuter = ElemsPerLoad;
     static constexpr int ThreadsPerRow = SmemAtomInner / ElemsPerLoad;
 
