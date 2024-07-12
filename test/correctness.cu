@@ -32,7 +32,7 @@ int main(int argc, char const *argv[]) {
 
     // Fill with random data
     cutlass::reference::device::TensorFillRandomGaussian(A_tensor.device_view(), 0);
-    cutlass::reference::device::TensorFillRandomGaussian(B_tensor.device_view(), 0);
+    cutlass::reference::device::TensorFillRandomGaussian(B_tensor.device_view(), 1);
 
     // Test for correctness
     // Ours
@@ -40,12 +40,12 @@ int main(int argc, char const *argv[]) {
     // Reference
     cutlass::reference::device::compute_gemm(
         {static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)},
-        float(1),
+        1.0f,
         A_tensor.device_ref(),
         B_tensor.device_ref(),
-        float(0),
+        0.0f,
         C_ref_tensor.device_ref(),
-        float(0));
+        0.f);
     cudaDeviceSynchronize();
 
     // Copy output data to host for comparison
