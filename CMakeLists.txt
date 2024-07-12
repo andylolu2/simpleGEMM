@@ -25,5 +25,7 @@ function(compile name source_file)
 endfunction()
 
 compile(main main.cu)
+compile(wmma wmma.cu)
 compile(reference test/reference.cu)
 compile(correctness test/correctness.cu)
+compile(correctness_wmma test/correctness_wmma.cu)
