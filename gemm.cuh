@@ -11,6 +11,8 @@ using ct::_;
 using ct::Int;
 template <typename T>
 using Gmem = ct::ViewEngine<ct::gmem_ptr<T *>>;
+template <typename T>
+using Smem = ct::ViewEngine<ct::smem_ptr<T *>>;
 
 namespace simplegemm {
 // GEMM configuration class: Handles the compile-time computation of the kernel parameters.
@@ -66,12 +68,10 @@ struct KernelTraits {
     using GmemCopyValLayoutA = ct::Layout<ct::Shape<Int<1>, Int<ElemsPerLoad>>>;
 
    public:
-    // Tiled copy of A from gmem -> smem
-    using GmemTiledCopyA = decltype(ct::make_tiled_copy(GmemCopyAtom{},
-                                                        GmemCopyThreadLayoutA{},
-                                                        GmemCopyValLayoutA{}));
-    // Tiled copy of B from gmem -> smem
-    using GmemTiledCopyB = GmemTiledCopyA;
+    // Tiled copy of A/B from gmem -> smem
+    using GmemTiledCopyAB = decltype(ct::make_tiled_copy(GmemCopyAtom{},
+                                                         GmemCopyThreadLayoutA{},
+                                                         GmemCopyValLayoutA{}));
     // Copy atom of C from rmem -> gmem
     using GmemCopyC = GmemCopyAtom;
 
@@ -94,6 +94,84 @@ struct KernelTraits {
     using SmemTiledCopyA = decltype(ct::make_tiled_copy_A(SmemCopyAtom{}, TiledMMA{}));
     // Tiled copy of B from smem -> rmem
     using SmemTiledCopyB = decltype(ct::make_tiled_copy_B(SmemCopyAtom{}, TiledMMA{}));
+};
+
+template <typename SrcDtype, typename SrcLayout, typename DstDtype, typename DstLayout>
+struct GmemToSmemLoader {
+    ct::Tensor<Gmem<SrcDtype>, SrcLayout> srcs;
+    ct::Tensor<Smem<DstDtype>, DstLayout> dst;
+    typename KernelTraits::GmemTiledCopyAB tiled_copy;
+
+    // Constructor
+    __device__ GmemToSmemLoader(const ct::Tensor<Gmem<SrcDtype>, SrcLayout> &srcs_,
+                                ct::Tensor<Smem<DstDtype>, DstLayout> &dst_)
+        : srcs(srcs_),
+          dst(dst_) {}
+
+    // Load data of the k-th block from gmem to smem
+    __device__ void operator()(size_t k) {
+        auto thread_copy = tiled_copy.get_thread_slice(threadIdx.x);
+        auto src_frags = thread_copy.partition_S(srcs);
+        auto dst_frag = thread_copy.partition_D(dst);
+        ct::copy(tiled_copy, src_frags(_, _, _, k), dst_frag);
+    }
+};
+
+struct SmemGemm {
+    ct::Tensor<Smem<ct::half_t>, KernelTraits::SmemLayoutA> A;
+    ct::Tensor<Smem<ct::half_t>, KernelTraits::SmemLayoutB> B;
+    ct::Tensor<Gmem<ct::half_t>, KernelTraits::LayoutBlkC> C;
+    typename KernelTraits::TiledMMA tiled_mma;
+    typename KernelTraits::SmemTiledCopyA smem_tiled_copy_A;
+    typename KernelTraits::SmemTiledCopyB smem_tiled_copy_B;
+    typename KernelTraits::GmemCopyC gmem_copy_C;
+
+    decltype(tiled_mma.get_thread_slice(0u)) thread_mma;
+    decltype(thread_mma.partition_fragment_A(A)) A_frag;
+    decltype(thread_mma.partition_fragment_B(B)) B_frag;
+    decltype(thread_mma.partition_fragment_C(C)) C_frag;
+    decltype(thread_mma.partition_C(C)) C_frag_out;
+
+    // Constructor
+    __device__ SmemGemm(const ct::Tensor<Smem<ct::half_t>, KernelTraits::SmemLayoutA> &A_,
+                        const ct::Tensor<Smem<ct::half_t>, KernelTraits::SmemLayoutB> &B_,
+                        ct::Tensor<Gmem<ct::half_t>, KernelTraits::LayoutBlkC> &C_)
+        : A(A_),
+          B(B_),
+          C(C_),
+
+          thread_mma(tiled_mma.get_thread_slice(threadIdx.x)),
+          A_frag(thread_mma.partition_fragment_A(A)),
+          B_frag(thread_mma.partition_fragment_B(B)),
+          C_frag(thread_mma.partition_fragment_C(C)),
+          C_frag_out(thread_mma.partition_C(C)) {
+        ct::clear(C_frag);
+    }
+
+    // Perform Smem GEMM: C += A @ B
+    __device__ void operator()() {
+        // Load A and B from smem to registers (distributed across threads)
+        typename KernelTraits::SmemTiledCopyA smem_tiled_copy_A;
+        auto thr_copy_A = smem_tiled_copy_A.get_thread_slice(threadIdx.x);
+        auto sA_to_rA_src = thr_copy_A.partition_S(A);    // COPY_V, COPY_M, COPY_K
+        auto sA_to_rA_dst = thr_copy_A.retile_D(A_frag);  // COPY_V, COPY_M, COPY_K
+
+        typename KernelTraits::SmemTiledCopyB smem_tiled_copy_B;
+        auto thr_copy_B = smem_tiled_copy_B.get_thread_slice(threadIdx.x);
+        auto sB_to_rB_src = thr_copy_B.partition_S(B);    // COPY_V, COPY_N, COPY_K
+        auto sB_to_rB_dst = thr_copy_B.retile_D(B_frag);  // COPY_V, COPY_N, COPY_K
+
+        ct::copy(smem_tiled_copy_A, sA_to_rA_src, sA_to_rA_dst);
+        ct::copy(smem_tiled_copy_B, sB_to_rB_src, sB_to_rB_dst);
+
+        // Perform GEMM
+        ct::gemm(tiled_mma, A_frag, B_frag, C_frag);
+    }
+
+    // Write back result to gmem
+    __device__ void write_back() {
+        ct::copy(gmem_copy_C, C_frag, C_frag_out);
+    }
 };
 
 __device__ std::tuple<int, int> threadblock_swizzle(int idx, int m, int n, int group_size_m) {
@@ -137,56 +215,20 @@ __global__ void gemm_kernel(
     auto sA = ct::make_tensor(ct::make_smem_ptr(sA_data), smem_layout_A);
     auto sB = ct::make_tensor(ct::make_smem_ptr(sB_data), smem_layout_B);
 
-    typename KernelTraits::GmemTiledCopyA gmem_tiled_copy_A;
-    typename KernelTraits::GmemTiledCopyA gmem_tiled_copy_B;
-    auto gmem_thr_copy_A = gmem_tiled_copy_A.get_thread_slice(threadIdx.x);
-    auto gmem_thr_copy_B = gmem_tiled_copy_B.get_thread_slice(threadIdx.x);
-
-    // Fragments for gmem -> smem copy
-    auto gA_to_sA_src = gmem_thr_copy_A.partition_S(A_blk);  // COPY_V, COPY_M, COPY_K, N_BLK_K
-    auto gA_to_sA_dst = gmem_thr_copy_A.partition_D(sA);     // COPY_V, COPY_M, COPY_K
-    auto gB_to_sB_src = gmem_thr_copy_B.partition_S(B_blk);  // COPY_V, COPY_N, COPY_K, N_BLK_K
-    auto gB_to_sB_dst = gmem_thr_copy_B.partition_D(sB);     // COPY_V, COPY_N, COPY_K
-
-    // Fragments of the warp-level tiles (distributed across threads' registers)
-    // They will be inputs/outputs of the warp-level GEMM
-    typename KernelTraits::TiledMMA tiled_mma;
-    auto thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
-    auto rA = thr_mma.partition_fragment_A(sA);     // MMA, MMA_M, MMA_K
-    auto rB = thr_mma.partition_fragment_B(sB);     // MMA, MMA_N, MMA_K
-    auto rC = thr_mma.partition_fragment_C(C_blk);  // MMA, MMA_M, MMA_N
-    auto gC = thr_mma.partition_C(C_blk);           // Corresponding fragment in gmem to write back
-    ct::clear(rC);
-
-    // Fragments for smem -> rmem copy
-    typename KernelTraits::SmemTiledCopyA smem_tiled_copy_A;
-    auto thr_copy_A = smem_tiled_copy_A.get_thread_slice(threadIdx.x);
-    auto sA_to_rA_src = thr_copy_A.partition_S(sA);  // COPY_V, COPY_M, COPY_K
-    auto sA_to_rA_dst = thr_copy_A.retile_D(rA);     // COPY_V, COPY_M, COPY_K
-
-    typename KernelTraits::SmemTiledCopyB smem_tiled_copy_B;
-    auto thr_copy_B = smem_tiled_copy_B.get_thread_slice(threadIdx.x);
-    auto sB_to_rB_src = thr_copy_B.partition_S(sB);  // COPY_V, COPY_N, COPY_K
-    auto sB_to_rB_dst = thr_copy_B.retile_D(rB);     // COPY_V, COPY_N, COPY_K
+    GmemToSmemLoader loader_A(A_blk, sA);
+    GmemToSmemLoader loader_B(B_blk, sB);
+    SmemGemm smem_gemm(sA, sB, C_blk);
 
     // Main loop
-    for (size_t k_blk = 0; k_blk < ct::size<3>(gA_to_sA_src); k_blk++) {
+    for (size_t k = 0; k < ct::size<2>(A_blk); k++) {
         // Populate sA and sB by copying gmem -> smem (coorperatively within a threadblock)
-        ct::copy(gmem_tiled_copy_A, gA_to_sA_src(_, _, _, k_blk), gA_to_sA_dst);
-        ct::copy(gmem_tiled_copy_B, gB_to_sB_src(_, _, _, k_blk), gB_to_sB_dst);
+        loader_A(k);
+        loader_B(k);
         __syncthreads();
-
-        // Load rA and rB by copying smem -> rmem (coorperatively within a warp)
-        ct::copy(smem_tiled_copy_A, sA_to_rA_src, sA_to_rA_dst);
-        ct::copy(smem_tiled_copy_B, sB_to_rB_src, sB_to_rB_dst);
-
-        // Perform gemm
-        ct::gemm(tiled_mma, rA, rB, rC);
+        smem_gemm();
     }
 
-    // Write back result
-    typename KernelTraits::GmemCopyC gmem_copy_C;
-    ct::copy(gmem_copy_C, rC, gC);
+    smem_gemm.write_back();
 }
 
 // Host interface
