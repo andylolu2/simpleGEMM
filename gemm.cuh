@@ -96,30 +96,7 @@ struct KernelTraits {
     using SmemTiledCopyB = decltype(ct::make_tiled_copy_B(SmemCopyAtom{}, TiledMMA{}));
 };
 
-template <typename SrcDtype, typename SrcLayout, typename DstDtype, typename DstLayout>
-struct GmemToSmemLoader {
-    ct::Tensor<Gmem<SrcDtype>, SrcLayout> srcs;
-    ct::Tensor<Smem<DstDtype>, DstLayout> dst;
-    typename KernelTraits::GmemTiledCopyAB tiled_copy;
-
-    // Constructor
-    __device__ GmemToSmemLoader(const ct::Tensor<Gmem<SrcDtype>, SrcLayout> &srcs_,
-                                ct::Tensor<Smem<DstDtype>, DstLayout> &dst_)
-        : srcs(srcs_),
-          dst(dst_) {}
-
-    // Load data of the k-th block from gmem to smem
-    __device__ void operator()(size_t k) {
-        auto thread_copy = tiled_copy.get_thread_slice(threadIdx.x);
-        auto src_frags = thread_copy.partition_S(srcs);
-        auto dst_frag = thread_copy.partition_D(dst);
-        ct::copy(tiled_copy, src_frags(_, _, _, k), dst_frag);
-    }
-};
-
 struct SmemGemm {
-    ct::Tensor<Smem<ct::half_t>, KernelTraits::SmemLayoutA> A;
-    ct::Tensor<Smem<ct::half_t>, KernelTraits::SmemLayoutB> B;
     ct::Tensor<Gmem<ct::half_t>, KernelTraits::LayoutBlkC> C;
     typename KernelTraits::TiledMMA tiled_mma;
     typename KernelTraits::SmemTiledCopyA smem_tiled_copy_A;
@@ -127,41 +104,32 @@ struct SmemGemm {
     typename KernelTraits::GmemCopyC gmem_copy_C;
 
     decltype(tiled_mma.get_thread_slice(0u)) thread_mma;
-    decltype(thread_mma.partition_fragment_A(A)) A_frag;
-    decltype(thread_mma.partition_fragment_B(B)) B_frag;
     decltype(thread_mma.partition_fragment_C(C)) C_frag;
-    decltype(thread_mma.partition_C(C)) C_frag_out;
 
-    // Constructor
-    __device__ SmemGemm(const ct::Tensor<Smem<ct::half_t>, KernelTraits::SmemLayoutA> &A_,
-                        const ct::Tensor<Smem<ct::half_t>, KernelTraits::SmemLayoutB> &B_,
-                        ct::Tensor<Gmem<ct::half_t>, KernelTraits::LayoutBlkC> &C_)
-        : A(A_),
-          B(B_),
-          C(C_),
-
+    __device__ SmemGemm(ct::Tensor<Gmem<ct::half_t>, KernelTraits::LayoutBlkC> &output)
+        : C(output),
           thread_mma(tiled_mma.get_thread_slice(threadIdx.x)),
-          A_frag(thread_mma.partition_fragment_A(A)),
-          B_frag(thread_mma.partition_fragment_B(B)),
-          C_frag(thread_mma.partition_fragment_C(C)),
-          C_frag_out(thread_mma.partition_C(C)) {
+          C_frag(thread_mma.partition_fragment_C(C)) {
         ct::clear(C_frag);
     }
 
     // Perform Smem GEMM: C += A @ B
-    __device__ void operator()() {
+    __device__ void operator()(
+        const ct::Tensor<Smem<ct::half_t>, KernelTraits::SmemLayoutA> &sA,
+        const ct::Tensor<Smem<ct::half_t>, KernelTraits::SmemLayoutB> &sB) {
+        // Allocate registers distributed across threads to store operands
+        auto A_frag = thread_mma.partition_fragment_A(sA);
+        auto B_frag = thread_mma.partition_fragment_B(sB);
+
         // Load A and B from smem to registers (distributed across threads)
-        typename KernelTraits::SmemTiledCopyA smem_tiled_copy_A;
         auto thr_copy_A = smem_tiled_copy_A.get_thread_slice(threadIdx.x);
-        auto sA_to_rA_src = thr_copy_A.partition_S(A);    // COPY_V, COPY_M, COPY_K
+        auto sA_to_rA_src = thr_copy_A.partition_S(sA);   // COPY_V, COPY_M, COPY_K
         auto sA_to_rA_dst = thr_copy_A.retile_D(A_frag);  // COPY_V, COPY_M, COPY_K
-
-        typename KernelTraits::SmemTiledCopyB smem_tiled_copy_B;
-        auto thr_copy_B = smem_tiled_copy_B.get_thread_slice(threadIdx.x);
-        auto sB_to_rB_src = thr_copy_B.partition_S(B);    // COPY_V, COPY_N, COPY_K
-        auto sB_to_rB_dst = thr_copy_B.retile_D(B_frag);  // COPY_V, COPY_N, COPY_K
-
         ct::copy(smem_tiled_copy_A, sA_to_rA_src, sA_to_rA_dst);
+
+        auto thr_copy_B = smem_tiled_copy_B.get_thread_slice(threadIdx.x);
+        auto sB_to_rB_src = thr_copy_B.partition_S(sB);   // COPY_V, COPY_N, COPY_K
+        auto sB_to_rB_dst = thr_copy_B.retile_D(B_frag);  // COPY_V, COPY_N, COPY_K
         ct::copy(smem_tiled_copy_B, sB_to_rB_src, sB_to_rB_dst);
 
         // Perform GEMM
@@ -170,9 +138,21 @@ struct SmemGemm {
 
     // Write back result to gmem
     __device__ void write_back() {
+        auto C_frag_out = thread_mma.partition_C(C);  // Corresponding location in output tensor
         ct::copy(gmem_copy_C, C_frag, C_frag_out);
     }
 };
+
+template <typename T, typename SrcLayout, typename DstLayout>
+__device__ void load_block_from_gmem_to_smem(
+    ct::Tensor<Gmem<T>, SrcLayout> src,
+    ct::Tensor<Smem<T>, DstLayout> dst) {
+    typename KernelTraits::GmemTiledCopyAB tiled_copy;
+    auto thread_copy = tiled_copy.get_thread_slice(threadIdx.x);
+    auto src_frag = thread_copy.partition_S(src);
+    auto dst_frag = thread_copy.partition_D(dst);
+    ct::copy(tiled_copy, src_frag, dst_frag);
+}
 
 __device__ std::tuple<int, int> threadblock_swizzle(int idx, int m, int n, int group_size_m) {
     // Reordering the block access pattern helps to improve L2 cache hit rate.
@@ -200,9 +180,9 @@ __global__ void gemm_kernel(
         ct::ceil_div(ct::size<0>(A), Int<KernelTraits::BLK_M>{}),
         ct::ceil_div(ct::size<0>(B), Int<KernelTraits::BLK_N>{}),
         KernelTraits::GroupSizeM);
-    typename KernelTraits::BlockShapeA block_shape_A;
-    typename KernelTraits::BlockShapeB block_shape_B;
-    typename KernelTraits::BlockShapeC block_shape_C;
+    typename KernelTraits::BlockShapeA block_shape_A;                                         // BLK_M, BLK_K
+    typename KernelTraits::BlockShapeB block_shape_B;                                         // BLK_N, BLK_K
+    typename KernelTraits::BlockShapeC block_shape_C;                                         // BLK_M, BLK_N
     auto A_blk = ct::local_tile(A, block_shape_A, ct::make_coord(block_idx_m, _));            // BLK_M, BLK_K, N_BLK_K
     auto B_blk = ct::local_tile(B, block_shape_B, ct::make_coord(block_idx_n, _));            // BLK_N, BLK_K, N_BLK_K
     auto C_blk = ct::local_tile(C, block_shape_C, ct::make_coord(block_idx_m, block_idx_n));  // BLK_M, BLK_N
@@ -215,19 +195,14 @@ __global__ void gemm_kernel(
     auto sA = ct::make_tensor(ct::make_smem_ptr(sA_data), smem_layout_A);
     auto sB = ct::make_tensor(ct::make_smem_ptr(sB_data), smem_layout_B);
 
-    GmemToSmemLoader loader_A(A_blk, sA);
-    GmemToSmemLoader loader_B(B_blk, sB);
-    SmemGemm smem_gemm(sA, sB, C_blk);
-
     // Main loop
+    SmemGemm smem_gemm(C_blk);
     for (size_t k = 0; k < ct::size<2>(A_blk); k++) {
-        // Populate sA and sB by copying gmem -> smem (coorperatively within a threadblock)
-        loader_A(k);
-        loader_B(k);
+        load_block_from_gmem_to_smem(A_blk(_, _, k), sA);  // Load the k-th A block from gmem to smem
+        load_block_from_gmem_to_smem(B_blk(_, _, k), sB);  // Load the k-th B block from gmem to smem
         __syncthreads();
-        smem_gemm();
+        smem_gemm(sA, sB);
     }
-
     smem_gemm.write_back();
 }
 
