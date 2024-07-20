@@ -17,32 +17,53 @@ using Smem = ct::ViewEngine<ct::smem_ptr<T *>>;
 namespace simplegemm {
 // GEMM configuration class: Handles the compile-time computation of the kernel parameters.
 // Good default values are hard-coded but they might be tuned to give better performance.
-struct KernelTraits {
+template <typename T>
+concept GemmConfig =
+    std::is_same_v<decltype(T::BLK_M), const int64_t> &&
+    std::is_same_v<decltype(T::BLK_N), const int64_t> &&
+    std::is_same_v<decltype(T::BLK_K), const int64_t> &&
+    std::is_same_v<decltype(T::GroupSizeM), const int64_t> &&
+    std::is_same_v<decltype(T::NumThreads), const int64_t> &&
+    requires {
+        typename T::LayoutA;  // Layout of A
+        typename T::LayoutB;  // Layout of B
+        typename T::LayoutC;  // Layout of C
+
+        typename T::SmemLayoutA;  // smem layout for one block of A
+        typename T::SmemLayoutB;  // smem layout for one block of B
+
+        typename T::GmemCopyA;  // gmem -> smem copy operation for A
+        typename T::GmemCopyB;  // gmem -> smem copy operation for B
+        typename T::GmemCopyC;  // rmem -> gmem copy operation for C
+
+        typename T::TiledMMA;   // MMA operation
+        typename T::SmemCopyA;  // smem -> rmem copy operation for A
+        typename T::SmemCopyB;  // smem -> rmem copy operation for B
+    };
+
+struct GemmConfigImpl {
    public:
     // 128x128x64 blocks seems to be a good default
-    static constexpr int BLK_M = 128;
-    static constexpr int BLK_N = 128;
-    static constexpr int BLK_K = 64;
-    static constexpr int GroupSizeM = 6;    // Generally want to choose group size ~= sqrt(no. of SMs).
-    static constexpr int NumThreads = 128;  // 4 warps
+    static constexpr int64_t BLK_M = 128;
+    static constexpr int64_t BLK_N = 128;
+    static constexpr int64_t BLK_K = 64;
+    static constexpr int64_t GroupSizeM = 6;    // Generally want to choose group size ~= sqrt(no. of SMs).
+    static constexpr int64_t NumThreads = 128;  // 4 warps
 
     // Row-major A, B, C
     using LayoutA = ct::Layout<ct::Shape<int64_t, int64_t>, ct::Stride<int64_t, Int<1>>>;
     using LayoutB = ct::Layout<ct::Shape<int64_t, int64_t>, ct::Stride<int64_t, Int<1>>>;
     using LayoutC = ct::Layout<ct::Shape<int64_t, int64_t>, ct::Stride<int64_t, Int<1>>>;
-    using BlockShapeA = ct::Shape<Int<BLK_M>, Int<BLK_K>>;
-    using BlockShapeB = ct::Shape<Int<BLK_N>, Int<BLK_K>>;
-    using BlockShapeC = ct::Shape<Int<BLK_M>, Int<BLK_N>>;
-    using LayoutBlkA = ct::Layout<ct::Shape<Int<BLK_M>, Int<BLK_K>, int64_t>, ct::Stride<int64_t, Int<1>, Int<BLK_K>>>;
-    using LayoutBlkB = ct::Layout<ct::Shape<Int<BLK_N>, Int<BLK_K>, int64_t>, ct::Stride<int64_t, Int<1>, Int<BLK_K>>>;
-    using LayoutBlkC = ct::Layout<ct::Shape<Int<BLK_M>, Int<BLK_N>>, ct::Stride<int64_t, Int<1>>>;
 
    private:
     static constexpr int AccessSizeBits = 128;
     static constexpr int ElemsPerLoad = AccessSizeBits / ct::sizeof_bits_v<ct::half_t>;
-    static constexpr int SmemAtomInner = std::min(64, BLK_K);
+    static constexpr int SmemAtomInner = std::min(static_cast<int64_t>(64), BLK_K);
     static constexpr int SmemAtomOuter = ElemsPerLoad;
     static constexpr int ThreadsPerRow = SmemAtomInner / ElemsPerLoad;
+
+    using BlockShapeA = ct::Shape<Int<128>, Int<64>>;
+    using BlockShapeB = ct::Shape<Int<128>, Int<64>>;
 
     // The layout of one tile of the smem block, will be tiled to fill the entire block.
     // The choice of this layout is important for performance.
@@ -69,9 +90,10 @@ struct KernelTraits {
 
    public:
     // Tiled copy of A/B from gmem -> smem
-    using GmemTiledCopyAB = decltype(ct::make_tiled_copy(GmemCopyAtom{},
-                                                         GmemCopyThreadLayoutA{},
-                                                         GmemCopyValLayoutA{}));
+    using GmemCopyA = decltype(ct::make_tiled_copy(GmemCopyAtom{},
+                                                   GmemCopyThreadLayoutA{},
+                                                   GmemCopyValLayoutA{}));
+    using GmemCopyB = GmemCopyA;
     // Copy atom of C from rmem -> gmem
     using GmemCopyC = GmemCopyAtom;
 
@@ -91,23 +113,29 @@ struct KernelTraits {
     // Tiled mma operation
     using TiledMMA = ct::TiledMMA<MmaAtom, MmaAtomLayout, MmaTiledShape>;
     // Tiled copy of A from smem -> rmem
-    using SmemTiledCopyA = decltype(ct::make_tiled_copy_A(SmemCopyAtom{}, TiledMMA{}));
+    using SmemCopyA = decltype(ct::make_tiled_copy_A(SmemCopyAtom{}, TiledMMA{}));
     // Tiled copy of B from smem -> rmem
-    using SmemTiledCopyB = decltype(ct::make_tiled_copy_B(SmemCopyAtom{}, TiledMMA{}));
+    using SmemCopyB = decltype(ct::make_tiled_copy_B(SmemCopyAtom{}, TiledMMA{}));
 };
+static_assert(GemmConfig<GemmConfigImpl>);
 
+template <GemmConfig Config>
 struct SmemGemm {
-    ct::Tensor<Gmem<ct::half_t>, KernelTraits::LayoutBlkC> C;
-    typename KernelTraits::TiledMMA tiled_mma;
-    typename KernelTraits::SmemTiledCopyA smem_tiled_copy_A;
-    typename KernelTraits::SmemTiledCopyB smem_tiled_copy_B;
-    typename KernelTraits::GmemCopyC gmem_copy_C;
+   private:
+    using StrideC = std::remove_reference_t<decltype((typename Config::LayoutC{}).stride())>;
+    using LayoutBlkC = ct::Layout<ct::Shape<Int<Config::BLK_M>, Int<Config::BLK_N>>, StrideC>;
+    ct::Tensor<Gmem<ct::half_t>, LayoutBlkC> &C;
+    typename Config::TiledMMA tiled_mma;
+    typename Config::SmemCopyA smem_tiled_copy_A;
+    typename Config::SmemCopyB smem_tiled_copy_B;
+    typename Config::GmemCopyC gmem_copy_C;
 
     decltype(tiled_mma.get_thread_slice(0u)) thread_mma;
     decltype(thread_mma.partition_fragment_C(C)) C_frag;
 
-    __device__ SmemGemm(ct::Tensor<Gmem<ct::half_t>, KernelTraits::LayoutBlkC> &output)
-        : C(output),
+   public:
+    __device__ SmemGemm(ct::Tensor<Gmem<ct::half_t>, LayoutBlkC> &C_)
+        : C(C_),
           thread_mma(tiled_mma.get_thread_slice(threadIdx.x)),
           C_frag(thread_mma.partition_fragment_C(C)) {
         ct::clear(C_frag);
@@ -115,8 +143,8 @@ struct SmemGemm {
 
     // Perform Smem GEMM: C += A @ B
     __device__ void operator()(
-        const ct::Tensor<Smem<ct::half_t>, KernelTraits::SmemLayoutA> &sA,
-        const ct::Tensor<Smem<ct::half_t>, KernelTraits::SmemLayoutB> &sB) {
+        const ct::Tensor<Smem<ct::half_t>, typename Config::SmemLayoutA> &sA,
+        const ct::Tensor<Smem<ct::half_t>, typename Config::SmemLayoutB> &sB) {
         // Allocate registers distributed across threads to store operands
         auto A_frag = thread_mma.partition_fragment_A(sA);
         auto B_frag = thread_mma.partition_fragment_B(sB);
@@ -143,11 +171,11 @@ struct SmemGemm {
     }
 };
 
-template <typename T, typename SrcLayout, typename DstLayout>
+template <typename T, typename SrcLayout, typename DstLayout, typename TiledCopy>
 __device__ void load_block_from_gmem_to_smem(
-    ct::Tensor<Gmem<T>, SrcLayout> src,
-    ct::Tensor<Smem<T>, DstLayout> dst) {
-    typename KernelTraits::GmemTiledCopyAB tiled_copy;
+    const ct::Tensor<Gmem<T>, SrcLayout> &src,
+    const ct::Tensor<Smem<T>, DstLayout> &dst,
+    TiledCopy tiled_copy) {
     auto thread_copy = tiled_copy.get_thread_slice(threadIdx.x);
     auto src_frag = thread_copy.partition_S(src);
     auto dst_frag = thread_copy.partition_D(dst);
@@ -170,36 +198,35 @@ __device__ std::tuple<int, int> threadblock_swizzle(int idx, int m, int n, int g
 }
 
 // Main kernel
+template <GemmConfig Config>
 __global__ void gemm_kernel(
-    ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutA> A,
-    ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutB> B,
-    ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutC> C) {
+    ct::Tensor<Gmem<ct::half_t>, typename Config::LayoutA> A,
+    ct::Tensor<Gmem<ct::half_t>, typename Config::LayoutB> B,
+    ct::Tensor<Gmem<ct::half_t>, typename Config::LayoutC> C) {
     // Threadblock-level paratitioning
-    auto [block_idx_m, block_idx_n] = threadblock_swizzle(
-        blockIdx.x,
-        ct::ceil_div(ct::size<0>(A), Int<KernelTraits::BLK_M>{}),
-        ct::ceil_div(ct::size<0>(B), Int<KernelTraits::BLK_N>{}),
-        KernelTraits::GroupSizeM);
-    typename KernelTraits::BlockShapeA block_shape_A;                                         // BLK_M, BLK_K
-    typename KernelTraits::BlockShapeB block_shape_B;                                         // BLK_N, BLK_K
-    typename KernelTraits::BlockShapeC block_shape_C;                                         // BLK_M, BLK_N
+    auto [block_idx_m, block_idx_n] = threadblock_swizzle(blockIdx.x, ct::size<0>(A) / Config::BLK_M, ct::size<0>(B) / Config::BLK_N, Config::GroupSizeM);
+    auto block_shape_A = ct::make_shape(Int<Config::BLK_M>{}, Int<Config::BLK_K>{});
+    auto block_shape_B = ct::make_shape(Int<Config::BLK_N>{}, Int<Config::BLK_K>{});
+    auto block_shape_C = ct::make_shape(Int<Config::BLK_M>{}, Int<Config::BLK_N>{});
     auto A_blk = ct::local_tile(A, block_shape_A, ct::make_coord(block_idx_m, _));            // BLK_M, BLK_K, N_BLK_K
     auto B_blk = ct::local_tile(B, block_shape_B, ct::make_coord(block_idx_n, _));            // BLK_N, BLK_K, N_BLK_K
     auto C_blk = ct::local_tile(C, block_shape_C, ct::make_coord(block_idx_m, block_idx_n));  // BLK_M, BLK_N
 
     // Allocate shared memory for the operands
-    typename KernelTraits::SmemLayoutA smem_layout_A;
-    typename KernelTraits::SmemLayoutB smem_layout_B;
+    typename Config::SmemLayoutA smem_layout_A;
+    typename Config::SmemLayoutB smem_layout_B;
     __shared__ ct::half_t sA_data[ct::cosize_v<decltype(smem_layout_A)>];
     __shared__ ct::half_t sB_data[ct::cosize_v<decltype(smem_layout_B)>];
     auto sA = ct::make_tensor(ct::make_smem_ptr(sA_data), smem_layout_A);
     auto sB = ct::make_tensor(ct::make_smem_ptr(sB_data), smem_layout_B);
 
     // Main loop
-    SmemGemm smem_gemm(C_blk);
+    typename Config::GmemCopyA gmem_copy_A;
+    typename Config::GmemCopyB gmem_copy_B;
+    SmemGemm<Config> smem_gemm(C_blk);
     for (size_t k = 0; k < ct::size<2>(A_blk); k++) {
-        load_block_from_gmem_to_smem(A_blk(_, _, k), sA);  // Load the k-th A block from gmem to smem
-        load_block_from_gmem_to_smem(B_blk(_, _, k), sB);  // Load the k-th B block from gmem to smem
+        load_block_from_gmem_to_smem(A_blk(_, _, k), sA, gmem_copy_A);  // Load the k-th A block from gmem to smem
+        load_block_from_gmem_to_smem(B_blk(_, _, k), sB, gmem_copy_B);  // Load the k-th B block from gmem to smem
         __syncthreads();
         smem_gemm(sA, sB);
     }
@@ -207,10 +234,11 @@ __global__ void gemm_kernel(
 }
 
 // Host interface
+template <GemmConfig Config>
 void gemm(
-    const ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutA> &A,
-    const ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutB> &B,
-    const ct::Tensor<Gmem<ct::half_t>, typename KernelTraits::LayoutC> &C) {
+    const ct::Tensor<Gmem<ct::half_t>, typename Config::LayoutA> &A,
+    const ct::Tensor<Gmem<ct::half_t>, typename Config::LayoutB> &B,
+    const ct::Tensor<Gmem<ct::half_t>, typename Config::LayoutC> &C) {
     assert(ct::size<0>(A) == ct::size<0>(C));  // M
     assert(ct::size<0>(B) == ct::size<1>(C));  // N
     assert(ct::size<1>(A) == ct::size<1>(B));  // K
@@ -219,12 +247,12 @@ void gemm(
     int64_t K = ct::size<1>(A);
 
     // We don't handle predication yet
-    assert(M % KernelTraits::BLK_M == 0);
-    assert(N % KernelTraits::BLK_N == 0);
-    assert(K % KernelTraits::BLK_K == 0);
-    dim3 block_dim(ct::ceil_div(M, KernelTraits::BLK_M) * ct::ceil_div(N, KernelTraits::BLK_N));
-    dim3 thread_dim(KernelTraits::NumThreads);
+    assert(M % Config::BLK_M == 0);
+    assert(N % Config::BLK_N == 0);
+    assert(K % Config::BLK_K == 0);
+    dim3 block_dim(M / Config::BLK_M * N / Config::BLK_N);
+    dim3 thread_dim(Config::NumThreads);
 
-    gemm_kernel<<<block_dim, thread_dim>>>(A, B, C);
+    gemm_kernel<Config><<<block_dim, thread_dim>>>(A, B, C);
 }
 }  // namespace simplegemm

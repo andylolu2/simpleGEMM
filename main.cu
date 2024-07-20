@@ -45,7 +45,7 @@ int main(int argc, char const *argv[]) {
     for (size_t i = 0; i < iters; i++) {
         cudaMemset(z_ptr, 0, 3 * 1024 * 1024);  // Flush L2 cache
         cudaEventRecord(start_events[i]);
-        simplegemm::gemm(A, B, C);
+        simplegemm::gemm<simplegemm::GemmConfigImpl>(A, B, C);
         cudaEventRecord(end_events[i]);
     }
 
@@ -58,7 +58,7 @@ int main(int argc, char const *argv[]) {
         total_duration += duration;
     }
     float flops = 2 * M * N * K * iters / (total_duration / 1000);
-    float bandwidth = ((M * K) * (N / simplegemm::KernelTraits::BLK_N) + (N * K) * (M / simplegemm::KernelTraits::BLK_M) + M * N) * iters * sizeof(ct::half_t) / (total_duration / 1000);
+    float bandwidth = ((M * K) * (N / simplegemm::GemmConfigImpl::BLK_N) + (N * K) * (M / simplegemm::GemmConfigImpl::BLK_M) + M * N) * iters * sizeof(ct::half_t) / (total_duration / 1000);
     std::cout << "Time elapse: " << total_duration << "ms" << std::endl;
     std::cout << "TFLOPS: " << flops / 1e12 << std::endl;
     std::cout << "Bandwidth: " << bandwidth / 1e9 << "GB/s" << std::endl;
