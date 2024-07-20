@@ -16,15 +16,15 @@ using Smem = ct::ViewEngine<ct::smem_ptr<T *>>;
 
 namespace simplegemm {
 // GEMM configuration class: Handles the compile-time computation of the kernel parameters.
-// Good default values are hard-coded but they might be tuned to give better performance.
 template <typename T>
 concept GemmConfig =
-    std::is_same_v<decltype(T::BLK_M), const int64_t> &&
-    std::is_same_v<decltype(T::BLK_N), const int64_t> &&
-    std::is_same_v<decltype(T::BLK_K), const int64_t> &&
-    std::is_same_v<decltype(T::GroupSizeM), const int64_t> &&
-    std::is_same_v<decltype(T::NumThreads), const int64_t> &&
     requires {
+        { T::BLK_M } -> std::same_as<const int64_t &>;
+        { T::BLK_N } -> std::same_as<const int64_t &>;
+        { T::BLK_K } -> std::same_as<const int64_t &>;
+        { T::GroupSizeM } -> std::same_as<const int64_t &>;
+        { T::NumThreads } -> std::same_as<const int64_t &>;
+
         typename T::LayoutA;  // Layout of A
         typename T::LayoutB;  // Layout of B
         typename T::LayoutC;  // Layout of C
