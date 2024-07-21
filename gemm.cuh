@@ -95,8 +95,7 @@ struct GemmConfigImpl {
                                                    GmemCopyValLayoutA{}));
     using GmemCopyB = GmemCopyA;
     // Copy atom of C from rmem -> gmem
-    // using GmemCopyC = GmemCopyAtom;
-    using GmemCopyC = ct::Copy_Atom<ct::AutoVectorizingCopyWithAssumedAlignment<AccessSizeBits>, ct::half_t>;
+    using GmemCopyC = GmemCopyAtom;
 
    private:
     // The atom of the smem -> rmem copy for A/B. Loads 4 8x8 matrices (distributed across threads) at a time.
@@ -169,6 +168,9 @@ struct SmemGemm {
     __device__ void write_back() {
         auto C_frag_out = thread_mma.partition_C(C);  // Corresponding location in output tensor
         ct::copy(gmem_copy_C, C_frag, C_frag_out);
+#if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
+        ct::cp_async_wait<0>();
+#endif
     }
 };
 
@@ -181,6 +183,9 @@ __device__ void load_block_from_gmem_to_smem(
     auto src_frag = thread_copy.partition_S(src);
     auto dst_frag = thread_copy.partition_D(dst);
     ct::copy(tiled_copy, src_frag, dst_frag);
+#if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
+    ct::cp_async_wait<0>();
+#endif
 }
 
 __device__ std::tuple<int, int> threadblock_swizzle(int idx, int m, int n, int group_size_m) {
@@ -216,8 +221,8 @@ __global__ void gemm_kernel(
     // Allocate shared memory for the operands
     typename Config::SmemLayoutA smem_layout_A;
     typename Config::SmemLayoutB smem_layout_B;
-    __shared__ ct::half_t sA_data[ct::cosize_v<decltype(smem_layout_A)>];
-    __shared__ ct::half_t sB_data[ct::cosize_v<decltype(smem_layout_B)>];
+    __shared__ __align__(16) ct::half_t sA_data[ct::cosize_v<decltype(smem_layout_A)>];
+    __shared__ __align__(16) ct::half_t sB_data[ct::cosize_v<decltype(smem_layout_B)>];
     auto sA = ct::make_tensor(ct::make_smem_ptr(sA_data), smem_layout_A);
     auto sB = ct::make_tensor(ct::make_smem_ptr(sB_data), smem_layout_B);
 
@@ -228,10 +233,6 @@ __global__ void gemm_kernel(
     for (size_t k = 0; k < ct::size<2>(A_blk); k++) {
         load_block_from_gmem_to_smem(A_blk(_, _, k), sA, gmem_copy_A);  // Load the k-th A block from gmem to smem
         load_block_from_gmem_to_smem(B_blk(_, _, k), sB, gmem_copy_B);  // Load the k-th B block from gmem to smem
-#if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
-        ct::cp_async_fence();
-        ct::cp_async_wait<0>();
-#endif
         __syncthreads();
         smem_gemm(sA, sB);
     }
