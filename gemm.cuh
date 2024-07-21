@@ -62,8 +62,8 @@ struct GemmConfigImpl {
     static constexpr int SmemAtomOuter = ElemsPerLoad;
     static constexpr int ThreadsPerRow = SmemAtomInner / ElemsPerLoad;
 
-    using BlockShapeA = ct::Shape<Int<128>, Int<64>>;
-    using BlockShapeB = ct::Shape<Int<128>, Int<64>>;
+    using BlockShapeA = ct::Shape<Int<BLK_M>, Int<BLK_K>>;
+    using BlockShapeB = ct::Shape<Int<BLK_N>, Int<BLK_K>>;
 
     // The layout of one tile of the smem block, will be tiled to fill the entire block.
     // The choice of this layout is important for performance.
@@ -95,7 +95,8 @@ struct GemmConfigImpl {
                                                    GmemCopyValLayoutA{}));
     using GmemCopyB = GmemCopyA;
     // Copy atom of C from rmem -> gmem
-    using GmemCopyC = GmemCopyAtom;
+    // using GmemCopyC = GmemCopyAtom;
+    using GmemCopyC = ct::Copy_Atom<ct::AutoVectorizingCopyWithAssumedAlignment<AccessSizeBits>, ct::half_t>;
 
    private:
     // The atom of the smem -> rmem copy for A/B. Loads 4 8x8 matrices (distributed across threads) at a time.
@@ -205,9 +206,9 @@ __global__ void gemm_kernel(
     ct::Tensor<Gmem<ct::half_t>, typename Config::LayoutC> C) {
     // Threadblock-level paratitioning
     auto [block_idx_m, block_idx_n] = threadblock_swizzle(blockIdx.x, ct::size<0>(A) / Config::BLK_M, ct::size<0>(B) / Config::BLK_N, Config::GroupSizeM);
-    auto block_shape_A = ct::make_shape(Int<Config::BLK_M>{}, Int<Config::BLK_K>{});
-    auto block_shape_B = ct::make_shape(Int<Config::BLK_N>{}, Int<Config::BLK_K>{});
-    auto block_shape_C = ct::make_shape(Int<Config::BLK_M>{}, Int<Config::BLK_N>{});
+    auto block_shape_A = ct::Shape<Int<Config::BLK_M>, Int<Config::BLK_K>>{};
+    auto block_shape_B = ct::Shape<Int<Config::BLK_N>, Int<Config::BLK_K>>{};
+    auto block_shape_C = ct::Shape<Int<Config::BLK_M>, Int<Config::BLK_N>>{};
     auto A_blk = ct::local_tile(A, block_shape_A, ct::make_coord(block_idx_m, _));            // BLK_M, BLK_K, N_BLK_K
     auto B_blk = ct::local_tile(B, block_shape_B, ct::make_coord(block_idx_n, _));            // BLK_N, BLK_K, N_BLK_K
     auto C_blk = ct::local_tile(C, block_shape_C, ct::make_coord(block_idx_m, block_idx_n));  // BLK_M, BLK_N
@@ -227,6 +228,10 @@ __global__ void gemm_kernel(
     for (size_t k = 0; k < ct::size<2>(A_blk); k++) {
         load_block_from_gmem_to_smem(A_blk(_, _, k), sA, gmem_copy_A);  // Load the k-th A block from gmem to smem
         load_block_from_gmem_to_smem(B_blk(_, _, k), sB, gmem_copy_B);  // Load the k-th B block from gmem to smem
+#if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
+        ct::cp_async_fence();
+        ct::cp_async_wait<0>();
+#endif
         __syncthreads();
         smem_gemm(sA, sB);
     }
