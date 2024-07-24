@@ -36,7 +36,7 @@ int main(int argc, char const *argv[]) {
 
     // Test for correctness
     // Ours
-    simplegemm::gemm<simplegemm::GemmConfigImpl>(A, B, C);
+    simplegemm::gemm(A, B, C);
     // Reference
     cutlass::reference::device::compute_gemm(
         {static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)},
