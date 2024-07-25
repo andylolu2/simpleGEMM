@@ -144,9 +144,7 @@ struct SmemGemm {
     __device__ void write_back() {
         auto C_frag_out = thread_mma.partition_C(C);  // Corresponding location in output tensor
         ct::copy(gmem_copy_C, C_frag, C_frag_out);
-#if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
         ct::cp_async_wait<0>();
-#endif
     }
 };
 
@@ -159,9 +157,7 @@ __device__ void load_block_from_gmem_to_smem(
     auto src_frag = thread_copy.partition_S(src);
     auto dst_frag = thread_copy.partition_D(dst);
     ct::copy(tiled_copy, src_frag, dst_frag);
-#if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
     ct::cp_async_wait<0>();
-#endif
 }
 
 __device__ std::tuple<int, int> threadblock_swizzle(int idx, int m, int n, int group_size_m) {
