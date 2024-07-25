@@ -135,6 +135,9 @@ struct SmemGemm {
 
         // Perform GEMM
         ct::gemm(tiled_mma, A_frag, B_frag, C_frag);
+
+        // Wait until all threads have finished using sA and sB
+        __syncthreads();
     }
 
     // Write back result to gmem
@@ -205,7 +208,7 @@ __global__ void gemm_kernel(
     for (size_t k = 0; k < ct::size<2>(A_blk); k++) {
         load_block_from_gmem_to_smem(A_blk(_, _, k), sA, gmem_copy_A);  // Load the k-th A block from gmem to smem
         load_block_from_gmem_to_smem(B_blk(_, _, k), sB, gmem_copy_B);  // Load the k-th B block from gmem to smem
-        __syncthreads();
+        __syncthreads();                                                // Wait until all threads have finished loading A and B
         smem_gemm(sA, sB);
     }
     smem_gemm.write_back();
