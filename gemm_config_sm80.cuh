@@ -2,7 +2,6 @@
 
 namespace ct = cute;
 
-using ct::_;
 using ct::Int;
 
 namespace simplegemm {
@@ -14,7 +13,6 @@ struct GemmConfigSm80 {
     static constexpr int64_t BLK_N = 128;
     static constexpr int64_t BLK_K = 64;
     static constexpr int64_t NumThreads = 128;  // 4 warps
-    static constexpr int64_t NumStages = 2;
 
    private:
     static constexpr int AccessSizeBits = 128;
@@ -22,6 +20,9 @@ struct GemmConfigSm80 {
     static constexpr int SmemAtomInner = std::min(64, static_cast<int>(BLK_K));
     static constexpr int SmemAtomOuter = ElemsPerLoad;
     static constexpr int ThreadsPerRow = SmemAtomInner / ElemsPerLoad;
+
+    using BlockShapeA = ct::Shape<Int<BLK_M>, Int<BLK_K>>;
+    using BlockShapeB = ct::Shape<Int<BLK_N>, Int<BLK_K>>;
 
     // The layout of one tile of the smem block, will be tiled to fill the entire block.
     // The choice of this layout is important for performance.
@@ -33,10 +34,8 @@ struct GemmConfigSm80 {
 
    public:
     // Layout of each block of A/B in shared memory
-    using SmemLayoutA = decltype(ct::tile_to_shape(SmemLayoutAtom{}, ct::Shape<Int<BLK_M>, Int<BLK_K>, Int<NumStages>>{}));
-    using SmemLayoutB = decltype(ct::tile_to_shape(SmemLayoutAtom{}, ct::Shape<Int<BLK_N>, Int<BLK_K>, Int<NumStages>>{}));
-    using SmemLayoutBlkA = decltype(SmemLayoutA{}(_, _, 0));
-    using SmemLayoutBlkB = decltype(SmemLayoutB{}(_, _, 0));
+    using SmemLayoutA = decltype(ct::tile_to_shape(SmemLayoutAtom{}, BlockShapeA{}));
+    using SmemLayoutB = decltype(ct::tile_to_shape(SmemLayoutAtom{}, BlockShapeB{}));
 
    private:
     // The copy atom for gmem -> smem (read A/B) or rmem -> gmem (store C).
