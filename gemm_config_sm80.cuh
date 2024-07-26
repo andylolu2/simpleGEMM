@@ -14,7 +14,7 @@ struct GemmConfigSm80 {
     static constexpr int64_t BLK_N = 128;
     static constexpr int64_t BLK_K = 64;
     static constexpr int64_t NumThreads = 128;  // 4 warps
-    static constexpr int64_t NumStages = 2;
+    static constexpr int64_t NumStages = 1;
 
    private:
     static constexpr int AccessSizeBits = 128;
