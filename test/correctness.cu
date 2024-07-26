@@ -9,6 +9,8 @@
 #include <cute/tensor.hpp>
 
 #include "gemm.cuh"
+#include "gemm_config_sm75.cuh"
+#include "gemm_config_sm80.cuh"
 
 namespace ct = cute;
 
@@ -34,9 +36,12 @@ int main(int argc, char const *argv[]) {
     cutlass::reference::device::TensorFillRandomGaussian(A_tensor.device_view(), 0);
     cutlass::reference::device::TensorFillRandomGaussian(B_tensor.device_view(), 1);
 
+    using GemmConfig = simplegemm::GemmConfigSm80;
+    // using GemmConfig = simplegemm::GemmConfigSm75;
+
     // Test for correctness
     // Ours
-    simplegemm::gemm(A, B, C);
+    simplegemm::gemm<GemmConfig>(A, B, C);
     // Reference
     cutlass::reference::device::compute_gemm(
         {static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)},

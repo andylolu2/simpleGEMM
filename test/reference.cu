@@ -32,7 +32,7 @@ int main(int argc, char const *argv[]) {
     using LayoutOutput = cutlass::layout::RowMajor;
     // Use tensor cores
     using MMAOp = cutlass::arch::OpClassTensorOp;
-    // Compile for SM75 (Turing)
+    // Compile for SM80 (or SM75)
     using SmArch = cutlass::arch::Sm80;
 
     using Gemm = cutlass::gemm::device::Gemm<ElementInputA,

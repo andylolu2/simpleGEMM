@@ -1,7 +1,6 @@
 #include <cute/tensor.hpp>
 
 namespace ct = cute;
-
 using ct::Int;
 
 namespace simplegemm {

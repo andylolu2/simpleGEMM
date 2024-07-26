@@ -2,9 +2,8 @@
 
 #include <cute/tensor.hpp>
 
-namespace ct = cute;
-
 // Define some useful aliases
+namespace ct = cute;
 using ct::_;
 using ct::Int;
 template <typename T>
@@ -35,7 +34,7 @@ struct SmemGemm {
     decltype(thread_mma.partition_fragment_C(C)) C_frag;
 
    public:
-    __device__ SmemGemm(ct::Tensor<Gmem<ct::half_t>, LayoutBlkC> &C_)
+    CUTE_DEVICE SmemGemm(ct::Tensor<Gmem<ct::half_t>, LayoutBlkC> &C_)
         : C(C_),
           thread_mma(tiled_mma.get_thread_slice(threadIdx.x)),
           C_frag(thread_mma.partition_fragment_C(C)) {
@@ -43,7 +42,7 @@ struct SmemGemm {
     }
 
     // Perform Smem GEMM: C += A @ B
-    __device__ void operator()(
+    CUTE_DEVICE void operator()(
         const ct::Tensor<Smem<ct::half_t>, typename GemmConfig::SmemLayoutA> &sA,
         const ct::Tensor<Smem<ct::half_t>, typename GemmConfig::SmemLayoutB> &sB) {
         // Allocate registers distributed across threads to store operands
@@ -63,28 +62,24 @@ struct SmemGemm {
 
         // Perform GEMM
         ct::gemm(tiled_mma, A_frag, B_frag, C_frag);
-
-        // Wait until all threads have finished using sA and sB
-        __syncthreads();
     }
 
     // Write back result to gmem
-    __device__ void write_back() {
+    CUTE_DEVICE void write_back() {
         auto C_frag_out = thread_mma.partition_C(C);  // Corresponding location in output tensor
         ct::copy(C_frag, C_frag_out);
-        ct::cp_async_wait<0>();
     }
 };
 
 template <typename T, typename SrcLayout, typename DstLayout, typename TiledCopy>
-__device__ void load_block_from_gmem_to_smem(
+CUTE_DEVICE void load_block_from_gmem_to_smem(
     const ct::Tensor<Gmem<T>, SrcLayout> &src,
     const ct::Tensor<Smem<T>, DstLayout> &dst,
     TiledCopy tiled_copy) {
     auto thread_copy = tiled_copy.get_thread_slice(threadIdx.x);
     auto src_frag = thread_copy.partition_S(src);
     auto dst_frag = thread_copy.partition_D(dst);
-    ct::copy(src_frag, dst_frag);
+    ct::copy(tiled_copy, src_frag, dst_frag);
 }
 
 // Reordering the block access pattern helps to improve L2 cache hit rate.
@@ -93,7 +88,7 @@ __device__ void load_block_from_gmem_to_smem(
 //  |  1 |  3 |  5 |  7 |
 //  |  2 |  4 |  6 |  8 |
 //  |  9 | 10 | 11 | 12 |
-__device__ std::tuple<int, int> threadblock_swizzle(int idx, int m, int n) {
+CUTE_DEVICE std::tuple<int, int> threadblock_swizzle(int idx, int m, int n) {
     // We choose group_size_m = sqrt(num_sms) to maximize L2 cache hit rate
     int num_sms;
     CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0));
@@ -124,8 +119,8 @@ __global__ void gemm_kernel(
     // Allocate shared memory for the operands
     typename GemmConfig::SmemLayoutA smem_layout_A;
     typename GemmConfig::SmemLayoutB smem_layout_B;
-    __shared__ __align__(16) ct::half_t sA_data[ct::cosize_v<decltype(smem_layout_A)>];
-    __shared__ __align__(16) ct::half_t sB_data[ct::cosize_v<decltype(smem_layout_B)>];
+    __shared__ __align__(sizeof(ct::uint128_t)) ct::half_t sA_data[ct::cosize_v<decltype(smem_layout_A)>];
+    __shared__ __align__(sizeof(ct::uint128_t)) ct::half_t sB_data[ct::cosize_v<decltype(smem_layout_B)>];
     auto sA = ct::make_tensor(ct::make_smem_ptr(sA_data), smem_layout_A);
     auto sB = ct::make_tensor(ct::make_smem_ptr(sB_data), smem_layout_B);
 
@@ -133,13 +128,17 @@ __global__ void gemm_kernel(
     typename GemmConfig::GmemCopyA gmem_copy_A;
     typename GemmConfig::GmemCopyB gmem_copy_B;
     SmemGemm<GemmConfig, LayoutC> smem_gemm(C_blk);
-    for (size_t k = 0; k < ct::size<2>(A_blk); k++) {
-        load_block_from_gmem_to_smem(A_blk(_, _, k), sA, gmem_copy_A);  // Load the k-th A block from gmem to smem
-        load_block_from_gmem_to_smem(B_blk(_, _, k), sB, gmem_copy_B);  // Load the k-th B block from gmem to smem
-        __syncthreads();                                                // Wait until all threads have finished loading A and B
+    int64_t N_BLK_K = ct::size<2>(A_blk);
+    for (size_t k = 0; k < N_BLK_K; k++) {
+        load_block_from_gmem_to_smem(A_blk(_, _, k), sA, gmem_copy_A);
+        load_block_from_gmem_to_smem(B_blk(_, _, k), sB, gmem_copy_B);
+        ct::cp_async_wait<0>();
+        __syncthreads();
         smem_gemm(sA, sB);
+        __syncthreads();
     }
     smem_gemm.write_back();
+    ct::cp_async_wait<0>();
 }
 
 // Host interface
