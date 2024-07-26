@@ -42,7 +42,7 @@ struct SmemGemm {
     decltype(thread_mma.partition_fragment_C(C)) C_frag;
 
    public:
-    CUTE_DEVICE SmemGemm(ct::Tensor<Gmem<ct::half_t>, LayoutBlkC> &C_)
+    __device__ SmemGemm(ct::Tensor<Gmem<ct::half_t>, LayoutBlkC> &C_)
         : C(C_),
           thread_mma(tiled_mma.get_thread_slice(threadIdx.x)),
           C_frag(thread_mma.partition_fragment_C(C)) {
@@ -50,7 +50,7 @@ struct SmemGemm {
     }
 
     // Perform Smem GEMM: C += A @ B
-    CUTE_DEVICE void operator()(
+    __device__ void operator()(
         const ct::Tensor<Smem<ct::half_t>, typename GemmConfig::SmemLayoutBlkA> &sA,
         const ct::Tensor<Smem<ct::half_t>, typename GemmConfig::SmemLayoutBlkB> &sB) {
         // Allocate registers distributed across threads to store operands
@@ -70,10 +70,13 @@ struct SmemGemm {
 
         // Perform GEMM
         ct::gemm(tiled_mma, A_frag, B_frag, C_frag);
+
+        // Wait until all threads have finished using sA and sB
+        __syncthreads();
     }
 
     // Write back result to gmem
-    CUTE_DEVICE void write_back() {
+    __device__ void write_back() {
         auto C_frag_out = thread_mma.partition_C(C);  // Corresponding location in output tensor
         ct::copy(C_frag, C_frag_out);
         ct::cp_async_wait<0>();
@@ -81,7 +84,7 @@ struct SmemGemm {
 };
 
 template <typename T, typename SrcLayout, typename DstLayout, typename TiledCopy>
-CUTE_DEVICE void load_block_from_gmem_to_smem(
+__device__ void load_block_from_gmem_to_smem(
     const ct::Tensor<Gmem<T>, SrcLayout> &src,
     const ct::Tensor<Smem<T>, DstLayout> &dst,
     TiledCopy tiled_copy) {
@@ -97,7 +100,7 @@ CUTE_DEVICE void load_block_from_gmem_to_smem(
 //  |  1 |  3 |  5 |  7 |
 //  |  2 |  4 |  6 |  8 |
 //  |  9 | 10 | 11 | 12 |
-CUTE_DEVICE std::tuple<int, int> threadblock_swizzle(int idx, int m, int n) {
+__device__ std::tuple<int, int> threadblock_swizzle(int idx, int m, int n) {
     // We choose group_size_m = sqrt(num_sms) to maximize L2 cache hit rate
     int num_sms;
     CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0));
@@ -137,42 +140,41 @@ __global__ void gemm_kernel(
     typename GemmConfig::GmemCopyB gmem_copy_B;
     SmemGemm<GemmConfig, LayoutC> smem_gemm(C_blk);
 
+    int64_t k_load = 0;  // Index of the next block to load
+    int64_t k_read = 0;  // Index of the next block to read
     size_t N_BLK_K = ct::size<2>(A_blk);
 
-    auto load_block = [&](int64_t k) {
-        load_block_from_gmem_to_smem(A_blk(_, _, k), sA(_, _, k % GemmConfig::NumStages), gmem_copy_A);
-        load_block_from_gmem_to_smem(B_blk(_, _, k), sB(_, _, k % GemmConfig::NumStages), gmem_copy_B);
+    auto load_next_stage = [&]() {
+        load_block_from_gmem_to_smem(A_blk(_, _, k_load), sA(_, _, k_load % GemmConfig::NumStages), gmem_copy_A);
+        load_block_from_gmem_to_smem(B_blk(_, _, k_load), sB(_, _, k_load % GemmConfig::NumStages), gmem_copy_B);
+        k_load++;
         ct::cp_async_fence();
     };
 
-    auto consume_block = [&](int64_t k) {
+    auto consume_next_stage = [&]() {
         ct::cp_async_wait<GemmConfig::NumStages - 1>();
-        __syncthreads();
-        smem_gemm(sA(_, _, k % GemmConfig::NumStages), sB(_, _, k % GemmConfig::NumStages));
-        if (GemmConfig::NumStages == 1) {
-            // If we only have one stage, we need to wait for the gemms to finish before overwriting the shared memory
-            __syncthreads();
-        }
+        smem_gemm(sA(_, _, k_read % GemmConfig::NumStages), sB(_, _, k_read % GemmConfig::NumStages));
+        k_read++;
     };
 
     // Main loop
     // 1. Fill pipeline by issuing loads of A and B blocks from gmem to smem
     CUTE_UNROLL
-    for (int64_t k = 0; k < GemmConfig::NumStages; k++) {
-        load_block(k);
+    for (size_t i = 0; i < GemmConfig::NumStages; i++) {
+        load_next_stage();
     }
 
     // 2. Main loop: Compute GEMM on the k-th block, then issue loads for the (k+NumStages)-th block
     CUTE_UNROLL
-    for (int64_t k = 0; k < N_BLK_K - GemmConfig::NumStages; k++) {
-        consume_block(k);
-        load_block(k + GemmConfig::NumStages);
+    for (size_t i = 0; i < N_BLK_K - GemmConfig::NumStages; i++) {
+        consume_next_stage();
+        load_next_stage();
     }
 
     // 3. Consume the remaining blocks
     CUTE_UNROLL
-    for (int64_t k = N_BLK_K - GemmConfig::NumStages; k < N_BLK_K; k++) {
-        consume_block(k);
+    for (size_t i = 0; i < GemmConfig::NumStages; i++) {
+        consume_next_stage();
         ct::cp_async_fence();  // Empty fence to ensure there are always `NumStages` fences
     }
 
