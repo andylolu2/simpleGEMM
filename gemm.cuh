@@ -21,6 +21,13 @@ CUTE_HOST_DEVICE void gpuAssert(cudaError_t code, const char *file, int line) {
 }
 
 namespace simplegemm {
+
+template <typename GemmConfig>
+struct SmemStorage {
+    ct::array_aligned<ct::half_t, ct::cosize_v<typename GemmConfig::SmemLayoutA>> a;
+    ct::array_aligned<ct::half_t, ct::cosize_v<typename GemmConfig::SmemLayoutB>> b;
+};
+
 template <typename GemmConfig, typename LayoutC>
 struct SmemGemm {
    private:
@@ -44,8 +51,8 @@ struct SmemGemm {
 
     // Perform Smem GEMM: C += A @ B
     __device__ void operator()(
-        const ct::Tensor<Smem<ct::half_t>, typename GemmConfig::SmemLayoutA> &sA,
-        const ct::Tensor<Smem<ct::half_t>, typename GemmConfig::SmemLayoutB> &sB) {
+        const ct::Tensor<Smem<ct::half_t>, typename GemmConfig::SmemLayoutBlkA> &sA,
+        const ct::Tensor<Smem<ct::half_t>, typename GemmConfig::SmemLayoutBlkB> &sB) {
         // Allocate registers distributed across threads to store operands
         auto A_frag = thread_mma.partition_fragment_A(sA);
         auto B_frag = thread_mma.partition_fragment_B(sB);
@@ -84,7 +91,7 @@ __device__ void load_block_from_gmem_to_smem(
     auto thread_copy = tiled_copy.get_thread_slice(threadIdx.x);
     auto src_frag = thread_copy.partition_S(src);
     auto dst_frag = thread_copy.partition_D(dst);
-    ct::copy(src_frag, dst_frag);
+    ct::copy(tiled_copy, src_frag, dst_frag);
 }
 
 // Reordering the block access pattern helps to improve L2 cache hit rate.
@@ -122,23 +129,55 @@ __global__ void gemm_kernel(
     auto C_blk = ct::local_tile(C, block_shape_C, ct::make_coord(block_idx_m, block_idx_n));  // BLK_M, BLK_N
 
     // Allocate shared memory for the operands
+    extern __shared__ char smem_raw[];
+    auto smem_storage = reinterpret_cast<SmemStorage<GemmConfig> *>(smem_raw);
     typename GemmConfig::SmemLayoutA smem_layout_A;
     typename GemmConfig::SmemLayoutB smem_layout_B;
-    __shared__ __align__(16) ct::half_t sA_data[ct::cosize_v<decltype(smem_layout_A)>];
-    __shared__ __align__(16) ct::half_t sB_data[ct::cosize_v<decltype(smem_layout_B)>];
-    auto sA = ct::make_tensor(ct::make_smem_ptr(sA_data), smem_layout_A);
-    auto sB = ct::make_tensor(ct::make_smem_ptr(sB_data), smem_layout_B);
+    auto sA = ct::make_tensor(ct::make_smem_ptr(smem_storage->a.data()), smem_layout_A);
+    auto sB = ct::make_tensor(ct::make_smem_ptr(smem_storage->b.data()), smem_layout_B);
 
-    // Main loop
     typename GemmConfig::GmemCopyA gmem_copy_A;
     typename GemmConfig::GmemCopyB gmem_copy_B;
     SmemGemm<GemmConfig, LayoutC> smem_gemm(C_blk);
-    for (size_t k = 0; k < ct::size<2>(A_blk); k++) {
-        load_block_from_gmem_to_smem(A_blk(_, _, k), sA, gmem_copy_A);  // Load the k-th A block from gmem to smem
-        load_block_from_gmem_to_smem(B_blk(_, _, k), sB, gmem_copy_B);  // Load the k-th B block from gmem to smem
-        __syncthreads();                                                // Wait until all threads have finished loading A and B
-        smem_gemm(sA, sB);
+
+    int64_t k_load = 0;  // Index of the next block to load
+    int64_t k_read = 0;  // Index of the next block to read
+    size_t N_BLK_K = ct::size<2>(A_blk);
+
+    auto load_next_stage = [&]() {
+        load_block_from_gmem_to_smem(A_blk(_, _, k_load), sA(_, _, k_load % GemmConfig::NumStages), gmem_copy_A);
+        load_block_from_gmem_to_smem(B_blk(_, _, k_load), sB(_, _, k_load % GemmConfig::NumStages), gmem_copy_B);
+        k_load++;
+        ct::cp_async_fence();
+    };
+
+    auto consume_next_stage = [&]() {
+        ct::cp_async_wait<GemmConfig::NumStages - 1>();
+        smem_gemm(sA(_, _, k_read % GemmConfig::NumStages), sB(_, _, k_read % GemmConfig::NumStages));
+        k_read++;
+    };
+
+    // Main loop
+    // 1. Fill pipeline by issuing loads of A and B blocks from gmem to smem
+    CUTE_UNROLL
+    for (size_t i = 0; i < GemmConfig::NumStages; i++) {
+        load_next_stage();
     }
+
+    // 2. Main loop: Compute GEMM on the k-th block, then issue loads for the (k+NumStages)-th block
+    CUTE_UNROLL
+    for (size_t i = 0; i < N_BLK_K - GemmConfig::NumStages; i++) {
+        consume_next_stage();
+        load_next_stage();
+    }
+
+    // 3. Consume the remaining blocks
+    CUTE_UNROLL
+    for (size_t i = 0; i < GemmConfig::NumStages; i++) {
+        consume_next_stage();
+        ct::cp_async_fence();  // Empty fence to ensure there are always `NumStages` fences
+    }
+
     smem_gemm.write_back();
 }
 
@@ -161,7 +200,9 @@ void gemm(
     assert(K % GemmConfig::BLK_K == 0);
     dim3 block_dim(M / GemmConfig::BLK_M * N / GemmConfig::BLK_N);
     dim3 thread_dim(GemmConfig::NumThreads);
+    size_t smem_size = sizeof(SmemStorage<GemmConfig>);
 
-    gemm_kernel<GemmConfig><<<block_dim, thread_dim>>>(A, B, C);
+    CUDA_CHECK(cudaFuncSetAttribute(gemm_kernel<GemmConfig, LayoutA, LayoutB, LayoutC>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    gemm_kernel<GemmConfig><<<block_dim, thread_dim, smem_size>>>(A, B, C);
 }
 }  // namespace simplegemm
