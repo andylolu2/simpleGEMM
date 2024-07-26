@@ -11,7 +11,12 @@ set(CMAKE_CXX_FLAGS "-Wall -Wextra")
 
 function(compile name source_file)
     add_executable(${name} ${source_file})
-    set_target_properties(${name} PROPERTIES CUDA_ARCHITECTURES native)
+    set_target_properties(
+        ${name} PROPERTIES 
+        CUDA_ARCHITECTURES native
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
     target_compile_options(
         ${name} PRIVATE
         -Wno-unused-function

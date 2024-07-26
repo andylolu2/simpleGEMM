@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cuda_runtime.h>
-
 #include <cute/tensor.hpp>
 
 namespace ct = cute;
@@ -14,94 +12,24 @@ using Gmem = ct::ViewEngine<ct::gmem_ptr<T *>>;
 template <typename T>
 using Smem = ct::ViewEngine<ct::smem_ptr<T *>>;
 
+#define CUDA_CHECK(ans) \
+    { gpuAssert((ans), __FILE__, __LINE__); }
+CUTE_HOST_DEVICE void gpuAssert(cudaError_t code, const char *file, int line) {
+    if (code != cudaSuccess) {
+        printf("GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+    }
+}
+
 namespace simplegemm {
-// GEMM configuration class: Handles the compile-time computation of the kernel parameters.
-struct GemmConfig {
-   public:
-    // 128x128x64 blocks seems to be a good default
-    static constexpr int64_t BLK_M = 128;
-    static constexpr int64_t BLK_N = 128;
-    static constexpr int64_t BLK_K = 64;
-    static constexpr int64_t GroupSizeM = 6;    // Generally want to choose group size ~= sqrt(no. of SMs).
-    static constexpr int64_t NumThreads = 128;  // 4 warps
-
-    // Row-major A, B, C
-    using LayoutA = ct::Layout<ct::Shape<int64_t, int64_t>, ct::Stride<int64_t, Int<1>>>;
-    using LayoutB = ct::Layout<ct::Shape<int64_t, int64_t>, ct::Stride<int64_t, Int<1>>>;
-    using LayoutC = ct::Layout<ct::Shape<int64_t, int64_t>, ct::Stride<int64_t, Int<1>>>;
-
-   private:
-    static constexpr int AccessSizeBits = 128;
-    static constexpr int ElemsPerLoad = AccessSizeBits / ct::sizeof_bits_v<ct::half_t>;
-    static constexpr int SmemAtomInner = std::min(static_cast<int64_t>(64), BLK_K);
-    static constexpr int SmemAtomOuter = ElemsPerLoad;
-    static constexpr int ThreadsPerRow = SmemAtomInner / ElemsPerLoad;
-
-    using BlockShapeA = ct::Shape<Int<BLK_M>, Int<BLK_K>>;
-    using BlockShapeB = ct::Shape<Int<BLK_N>, Int<BLK_K>>;
-
-    // The layout of one tile of the smem block, will be tiled to fill the entire block.
-    // The choice of this layout is important for performance.
-    // Swizzling reduces shared memory bank conflicts.
-    using SmemLayoutAtom = decltype(ct::composition(ct::Swizzle<3, 3, 3>{},
-                                                    ct::Layout<
-                                                        ct::Shape<Int<SmemAtomOuter>, Int<SmemAtomInner>>,
-                                                        ct::Stride<Int<SmemAtomInner>, Int<1>>>{}));
-
-   public:
-    // Layout of each block of A/B in shared memory
-    using SmemLayoutA = decltype(ct::tile_to_shape(SmemLayoutAtom{}, BlockShapeA{}));
-    using SmemLayoutB = decltype(ct::tile_to_shape(SmemLayoutAtom{}, BlockShapeB{}));
-
-   private:
-    // The copy atom for gmem -> smem (read A/B) or rmem -> gmem (store C).
-    using GmemCopyAtom = ct::Copy_Atom<
-        ct::AutoVectorizingCopyWithAssumedAlignment<AccessSizeBits>, ct::half_t>;
-    // The thread layout for one tile of the gmem -> smem copy.
-    using GmemCopyThreadLayoutA = ct::Layout<ct::Shape<Int<NumThreads / ThreadsPerRow>, Int<ThreadsPerRow>>,
-                                             ct::Stride<Int<ThreadsPerRow>, Int<1>>>;
-    // The value layout for each thread in the gmem -> smem copy.
-    using GmemCopyValLayoutA = ct::Layout<ct::Shape<Int<1>, Int<ElemsPerLoad>>>;
-
-   public:
-    // Tiled copy of A/B from gmem -> smem
-    using GmemCopyA = decltype(ct::make_tiled_copy(GmemCopyAtom{},
-                                                   GmemCopyThreadLayoutA{},
-                                                   GmemCopyValLayoutA{}));
-    using GmemCopyB = GmemCopyA;
-    // Copy atom of C from rmem -> gmem
-    using GmemCopyC = GmemCopyAtom;
-
-   private:
-    // The atom of the smem -> rmem copy for A/B. Loads 4 8x8 matrices (distributed across threads) at a time.
-    using SmemCopyAtom = ct::Copy_Atom<ct::SM75_U32x4_LDSM_N, ct::half_t>;
-    // The atom for the MMA operation. Each atom is a warp-wise instruction that computes a 16x8x8 mma (with tensor cores).
-    using MmaAtom = ct::MMA_Atom<ct::SM75_16x8x8_F32F16F16F32_TN>;
-    // We have 128 threads, so we use 4 warps laid out in 2x2x1.
-    using MmaAtomLayout = ct::Layout<ct::Shape<Int<2>, Int<2>, Int<1>>>;
-    // We want to use the `ldmatrix.x4.m8n8` instruction which loads 4 8x8 matrices for maximum efficiency.
-    // To make the operands A and B divisible into 4 8x8 matrices, we expand the problem size for each warp to 16x16x16.
-    // Accounting for the fact that we use 4 warps laid out in 2x2x1, the full tile size is 32x32x16.
-    using MmaTiledShape = ct::Tile<Int<32>, Int<32>, Int<16>>;
-
-   public:
-    // Tiled mma operation
-    using TiledMMA = ct::TiledMMA<MmaAtom, MmaAtomLayout, MmaTiledShape>;
-    // Tiled copy of A from smem -> rmem
-    using SmemCopyA = decltype(ct::make_tiled_copy_A(SmemCopyAtom{}, TiledMMA{}));
-    // Tiled copy of B from smem -> rmem
-    using SmemCopyB = decltype(ct::make_tiled_copy_B(SmemCopyAtom{}, TiledMMA{}));
-};
-
+template <typename GemmConfig, typename LayoutC>
 struct SmemGemm {
    private:
-    using StrideC = std::remove_reference_t<decltype((typename GemmConfig::LayoutC{}).stride())>;
+    using StrideC = std::decay_t<decltype(LayoutC{}.stride())>;
     using LayoutBlkC = ct::Layout<ct::Shape<Int<GemmConfig::BLK_M>, Int<GemmConfig::BLK_N>>, StrideC>;
     ct::Tensor<Gmem<ct::half_t>, LayoutBlkC> &C;
     typename GemmConfig::TiledMMA tiled_mma;
     typename GemmConfig::SmemCopyA smem_tiled_copy_A;
     typename GemmConfig::SmemCopyB smem_tiled_copy_B;
-    typename GemmConfig::GmemCopyC gmem_copy_C;
 
     decltype(tiled_mma.get_thread_slice(0u)) thread_mma;
     decltype(thread_mma.partition_fragment_C(C)) C_frag;
@@ -143,7 +71,7 @@ struct SmemGemm {
     // Write back result to gmem
     __device__ void write_back() {
         auto C_frag_out = thread_mma.partition_C(C);  // Corresponding location in output tensor
-        ct::copy(gmem_copy_C, C_frag, C_frag_out);
+        ct::copy(C_frag, C_frag_out);
         ct::cp_async_wait<0>();
     }
 };
@@ -156,17 +84,20 @@ __device__ void load_block_from_gmem_to_smem(
     auto thread_copy = tiled_copy.get_thread_slice(threadIdx.x);
     auto src_frag = thread_copy.partition_S(src);
     auto dst_frag = thread_copy.partition_D(dst);
-    ct::copy(tiled_copy, src_frag, dst_frag);
-    ct::cp_async_wait<0>();
+    ct::copy(src_frag, dst_frag);
 }
 
-__device__ std::tuple<int, int> threadblock_swizzle(int idx, int m, int n, int group_size_m) {
-    // Reordering the block access pattern helps to improve L2 cache hit rate.
-    // Triton's doc for matmul has a nice explanation: https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
-    // For m = 3, n = 4, group_size_m = 2, produces the coordiantes in the following order:
-    //  |  1 |  3 |  5 |  7 |
-    //  |  2 |  4 |  6 |  8 |
-    //  |  9 | 10 | 11 | 12 |
+// Reordering the block access pattern helps to improve L2 cache hit rate.
+// Triton's doc for matmul has a nice explanation: https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html
+// For m = 3, n = 4, group_size_m = 2, produces the coordiantes in the following order:
+//  |  1 |  3 |  5 |  7 |
+//  |  2 |  4 |  6 |  8 |
+//  |  9 | 10 | 11 | 12 |
+__device__ std::tuple<int, int> threadblock_swizzle(int idx, int m, int n) {
+    // We choose group_size_m = sqrt(num_sms) to maximize L2 cache hit rate
+    int num_sms;
+    CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0));
+    int group_size_m = std::sqrt(num_sms);
     int blocks_per_group = group_size_m * n;
     int first_block_idx_m = (idx / blocks_per_group) * group_size_m;
     group_size_m = min(m - first_block_idx_m, group_size_m);  // Min to handle edge case of m % group_size_m != 0
@@ -176,12 +107,13 @@ __device__ std::tuple<int, int> threadblock_swizzle(int idx, int m, int n, int g
 }
 
 // Main kernel
+template <typename GemmConfig, typename LayoutA, typename LayoutB, typename LayoutC>
 __global__ void gemm_kernel(
-    ct::Tensor<Gmem<ct::half_t>, typename GemmConfig::LayoutA> A,
-    ct::Tensor<Gmem<ct::half_t>, typename GemmConfig::LayoutB> B,
-    ct::Tensor<Gmem<ct::half_t>, typename GemmConfig::LayoutC> C) {
+    ct::Tensor<Gmem<ct::half_t>, LayoutA> A,
+    ct::Tensor<Gmem<ct::half_t>, LayoutB> B,
+    ct::Tensor<Gmem<ct::half_t>, LayoutC> C) {
     // Threadblock-level paratitioning
-    auto [block_idx_m, block_idx_n] = threadblock_swizzle(blockIdx.x, ct::size<0>(A) / GemmConfig::BLK_M, ct::size<0>(B) / GemmConfig::BLK_N, GemmConfig::GroupSizeM);
+    auto [block_idx_m, block_idx_n] = threadblock_swizzle(blockIdx.x, ct::size<0>(A) / GemmConfig::BLK_M, ct::size<0>(B) / GemmConfig::BLK_N);
     auto block_shape_A = ct::Shape<Int<GemmConfig::BLK_M>, Int<GemmConfig::BLK_K>>{};
     auto block_shape_B = ct::Shape<Int<GemmConfig::BLK_N>, Int<GemmConfig::BLK_K>>{};
     auto block_shape_C = ct::Shape<Int<GemmConfig::BLK_M>, Int<GemmConfig::BLK_N>>{};
@@ -200,7 +132,7 @@ __global__ void gemm_kernel(
     // Main loop
     typename GemmConfig::GmemCopyA gmem_copy_A;
     typename GemmConfig::GmemCopyB gmem_copy_B;
-    SmemGemm smem_gemm(C_blk);
+    SmemGemm<GemmConfig, LayoutC> smem_gemm(C_blk);
     for (size_t k = 0; k < ct::size<2>(A_blk); k++) {
         load_block_from_gmem_to_smem(A_blk(_, _, k), sA, gmem_copy_A);  // Load the k-th A block from gmem to smem
         load_block_from_gmem_to_smem(B_blk(_, _, k), sB, gmem_copy_B);  // Load the k-th B block from gmem to smem
@@ -211,10 +143,11 @@ __global__ void gemm_kernel(
 }
 
 // Host interface
+template <typename GemmConfig, typename LayoutA, typename LayoutB, typename LayoutC>
 void gemm(
-    const ct::Tensor<Gmem<ct::half_t>, typename GemmConfig::LayoutA> &A,
-    const ct::Tensor<Gmem<ct::half_t>, typename GemmConfig::LayoutB> &B,
-    const ct::Tensor<Gmem<ct::half_t>, typename GemmConfig::LayoutC> &C) {
+    const ct::Tensor<Gmem<ct::half_t>, LayoutA> &A,
+    const ct::Tensor<Gmem<ct::half_t>, LayoutB> &B,
+    const ct::Tensor<Gmem<ct::half_t>, LayoutC> &C) {
     assert(ct::size<0>(A) == ct::size<0>(C));  // M
     assert(ct::size<0>(B) == ct::size<1>(C));  // N
     assert(ct::size<1>(A) == ct::size<1>(B));  // K
@@ -229,6 +162,6 @@ void gemm(
     dim3 block_dim(M / GemmConfig::BLK_M * N / GemmConfig::BLK_N);
     dim3 thread_dim(GemmConfig::NumThreads);
 
-    gemm_kernel<<<block_dim, thread_dim>>>(A, B, C);
+    gemm_kernel<GemmConfig><<<block_dim, thread_dim>>>(A, B, C);
 }
 }  // namespace simplegemm
